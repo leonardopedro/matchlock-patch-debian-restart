@@ -2,13 +2,16 @@
 
 This guide provides the steps to apply the persistence patch, build the Debian packages with `mise`, and use the new CLI commands for VM restarts and allow-list updates.
 
-## 0. Apply the Patch
+## 0. Apply the Patch Kit
 
-If you are starting from the original Matchlock repository, apply the comprehensive persistence patch first:
+This kit contains both new files and a patch for existing files. It assumes your target `matchlock` repository is in a neighbor directory.
 
 ```bash
-# In the repository root
-git apply matchlock_persistence_full.patch
+# From this directory (the patch kit)
+./apply.sh
+
+# Then move to the matchlock repository
+cd ../matchlock
 ```
 
 ## 1. Create the Debian Packages
@@ -58,20 +61,20 @@ sudo matchlock setup linux
 ### Persistent Sandboxes
 To create a persistent sandbox that keeps its filesystem changes, run with `--rm=false`:
 ```bash
-sudo matchlock run --image debian:trixie-slim --rm=false bash
+matchlock run --image debian:trixie-slim --rm=false bash
 ```
 *Take note of the VM ID.*
 
 ### Restart a Stopped VM
 If a persistent sandbox stops, you can resume it using its ID:
 ```bash
-sudo matchlock start <vm-id>
+matchlock start <vm-id>
 ```
 
 ### Update Allow-list at Runtime
 You can add new hosts to the network allow-list while the VM is running (or stopped):
 ```bash
-sudo matchlock network allow <vm-id> "example.com" "api.openai.com"
+matchlock network allow <vm-id> "example.com" "api.openai.com"
 ```
 
 ## 5. Other CLI Commands
@@ -85,8 +88,8 @@ sudo matchlock network allow <vm-id> "example.com" "api.openai.com"
 
 ## 6. Example: Running an Agent with Persistence
 
-1.  **Launch**: `sudo matchlock run --image debian:trixie-slim --rm=false -it bash`
+1.  **Launch**: `matchlock run --image debian:trixie-slim --rm=false -it bash`
 2.  **Install tools**: `apt update && apt install curl -y`
 3.  **Exit & Stop**: `exit`
-4.  **Restart & Verify**: `sudo matchlock start <vm-id>` -> `curl --version` (still there!)
-5.  **Expand network**: `sudo matchlock network allow <vm-id> "github.com"`
+4.  **Restart & Verify**: `matchlock start <vm-id>` -> `curl --version` (still there!)
+5.  **Expand network**: `matchlock network allow <vm-id> "github.com"`
