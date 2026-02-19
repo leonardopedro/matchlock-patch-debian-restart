@@ -1,0 +1,503 @@
+diff --git a/.gitignore b/.gitignore
+index 85393b1..ff02ca4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -47,3 +47,27 @@ firecracker-*.log
+ /tmp/rootfs-build/
+ /REQ.md
+ /matchlock
++
++# New files not in upstream
++INSTRUCTIONS.md
++OpenClaw.Dockerfile
++cmd/matchlock/cmd_network.go.bk
++cmd/matchlock/cmd_start.go.bk
++debian.tar
++dist/
++firecracker-v1.14.1-x86_64.tgz
++guest-fused
++matchlock-dev
++matchlock_0.1.19_amd64.deb
++openclaw_debug.tar
++pkg/api/path.go.bk
++release-v1.14.1-x86_64/
++test_extract/
++
++# Debian build artifacts
++debian/.debhelper/
++debian/matchlock/
++debian/files
++debian/*.log
++debian/*.substvars
++debian/debhelper-build-stamp
+diff --git a/cmd/matchlock/errors.go b/cmd/matchlock/errors.go
+index bb82a9f..56f57b1 100644
+--- a/cmd/matchlock/errors.go
++++ b/cmd/matchlock/errors.go
+@@ -34,6 +34,7 @@ var (
+ 	ErrPipeExecFailed  = errors.New("pipe exec failed")
+ 	ErrSetRawMode      = errors.New("setting raw mode")
+ 	ErrInteractiveExec = errors.New("interactive exec failed")
++	ErrVMRunning       = errors.New("VM is already running")
+ )
+ 
+ // Pull errors
+@@ -61,6 +62,8 @@ var (
+ 	ErrCloseSandbox           = errors.New("closing sandbox")
+ 	ErrRemoveSandbox          = errors.New("removing sandbox")
+ 	ErrExecCommand            = errors.New("executing command")
++	ErrRegisterState         = errors.New("register VM state")
++	ErrParseConfig           = errors.New("parse VM config")
+ )
+ 
+ // Setup errors (Linux)
+diff --git a/mise.toml b/mise.toml
+index c78089a..e6d906d 100644
+--- a/mise.toml
++++ b/mise.toml
+@@ -13,6 +13,7 @@ _.path = ["~/go/bin"]
+ KERNEL_VERSION = "6.1.137"
+ OUTPUT_DIR = "{{env.HOME}}/.cache/matchlock"
+ REGISTRY = "ghcr.io/jingkaihe/matchlock"
++FIRECRACKER_VERSION = "1.14.1"
+ 
+ VERSION = "{{exec(command='cat VERSION.txt')}}"
+ GIT_COMMIT = "{{exec(command='echo ${GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}')}}"
+@@ -256,9 +257,14 @@ sudo cp bin/matchlock /usr/local/bin/matchlock
+ echo "Installed matchlock to /usr/local/bin"
+ """
+ 
++[tasks."build:firecracker:deb"]
++description = "Build Firecracker Debian package from source"
++run = "./scripts/build-firecracker-deb.sh"
++
+ [tasks."install:firecracker"]
+-description = "Install Firecracker binary"
+-run = "./scripts/install-firecracker.sh"
++description = "Install Firecracker (builds debian package from source)"
++depends = ["build:firecracker:deb"]
++run = "sudo dpkg -i firecracker_${FIRECRACKER_VERSION}_$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/').deb"
+ 
+ [tasks.images]
+ description = "Build kernel + rootfs"
+@@ -384,3 +390,55 @@ git push origin "v$VERSION"
+ echo "Tag v$VERSION pushed successfully!"
+ echo "GitHub Actions will automatically create a release with binaries."
+ """
++
++# =============================================================================
++# Debian package tasks
++# =============================================================================
++
++[tasks."build:deb"]
++description = "Build Debian package using mise for compilation (direct dpkg-deb approach)"
++run = """
++#!/usr/bin/env bash
++set -e
++
++# VERSION is provided by mise env
++ARCH=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
++
++echo "Building Debian package for matchlock v$VERSION ($ARCH)..."
++
++# Build binaries first
++mise run build
++
++# Prepare package root
++PKG_ROOT="dist/pkg-root"
++rm -rf "$PKG_ROOT"
++mkdir -p "$PKG_ROOT/usr/bin"
++mkdir -p "$PKG_ROOT/usr/share/doc/matchlock"
++mkdir -p "$PKG_ROOT/DEBIAN"
++
++# Copy binaries
++cp bin/matchlock "$PKG_ROOT/usr/bin/matchlock"
++cp bin/guest-init "$PKG_ROOT/usr/bin/guest-init"
++
++# Copy documentation & metadata
++cp README.md "$PKG_ROOT/usr/share/doc/matchlock/README.md"
++cp LICENSE "$PKG_ROOT/usr/share/doc/matchlock/copyright"
++[ -f debian/changelog ] && cp debian/changelog "$PKG_ROOT/usr/share/doc/matchlock/changelog"
++
++# Create DEBIAN/ metadata
++cp debian/control "$PKG_ROOT/DEBIAN/control"
++if [ -f debian/postinst ]; then
++  cp debian/postinst "$PKG_ROOT/DEBIAN/postinst"
++  chmod 755 "$PKG_ROOT/DEBIAN/postinst"
++fi
++
++# Build the package
++dpkg-deb --build "$PKG_ROOT" "matchlock_${VERSION}_${ARCH}.deb"
++
++echo ""
++echo "============================================"
++echo "Matchlock Debian package built successfully!"
++echo "============================================"
++echo ""
++echo "Package file: matchlock_${VERSION}_${ARCH}.deb"
++"""
+diff --git a/pkg/policy/engine.go b/pkg/policy/engine.go
+index fffb629..b89b04f 100644
+--- a/pkg/policy/engine.go
++++ b/pkg/policy/engine.go
+@@ -6,11 +6,13 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"strings"
++	"sync"
+ 
+ 	"github.com/jingkaihe/matchlock/pkg/api"
+ )
+ 
+ type Engine struct {
++	mu           sync.RWMutex
+ 	config       *api.NetworkConfig
+ 	placeholders map[string]string
+ }
+@@ -55,6 +57,9 @@ func (e *Engine) GetPlaceholders() map[string]string {
+ }
+ 
+ func (e *Engine) IsHostAllowed(host string) bool {
++	e.mu.RLock()
++	defer e.mu.RUnlock()
++
+ 	host = strings.Split(host, ":")[0]
+ 
+ 	if e.config.BlockPrivateIPs {
+@@ -76,7 +81,16 @@ func (e *Engine) IsHostAllowed(host string) bool {
+ 	return false
+ }
+ 
++func (e *Engine) UpdateAllowedHosts(hosts []string) {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	e.config.AllowedHosts = hosts
++}
++
+ func (e *Engine) OnRequest(req *http.Request, host string) (*http.Request, error) {
++	e.mu.RLock()
++	defer e.mu.RUnlock()
++
+ 	host = strings.Split(host, ":")[0]
+ 
+ 	for name, secret := range e.config.Secrets {
+@@ -97,6 +111,8 @@ func (e *Engine) OnResponse(resp *http.Response, req *http.Request, host string)
+ }
+ 
+ func (e *Engine) isSecretAllowedForHost(secretName, host string) bool {
++	// Note: Caller (OnRequest) already holds RLock
++
+ 	secret, ok := e.config.Secrets[secretName]
+ 	if !ok {
+ 		return false
+diff --git a/pkg/sandbox/errors.go b/pkg/sandbox/errors.go
+index 0637926..07fae4b 100644
+--- a/pkg/sandbox/errors.go
++++ b/pkg/sandbox/errors.go
+@@ -14,16 +14,16 @@ var (
+ 	ErrRelayProxy      = errors.New("relay port-forward proxy")
+ 
+ 	// Rootfs errors
+-	ErrGuestAgent   = errors.New("guest-agent not found")
+-	ErrGuestFused   = errors.New("guest-fused not found")
++	ErrGuestAgent      = errors.New("guest-agent not found")
++	ErrGuestFused      = errors.New("guest-fused not found")
+ 	ErrGuestInit    = errors.New("guest-init not found")
+ 	ErrResizeRootfs = errors.New("resize rootfs")
+-	ErrCreateTemp   = errors.New("create temp file")
+-	ErrWriteTemp    = errors.New("write temp file")
+-	ErrDebugfs      = errors.New("debugfs")
+-	ErrStatRootfs   = errors.New("stat rootfs")
+-	ErrTruncate     = errors.New("truncate rootfs")
+-	ErrResize2fs    = errors.New("resize2fs")
++	ErrCreateTemp      = errors.New("create temp file")
++	ErrWriteTemp       = errors.New("write temp file")
++	ErrDebugfs         = errors.New("debugfs")
++	ErrStatRootfs      = errors.New("stat rootfs")
++	ErrTruncate        = errors.New("truncate rootfs")
++	ErrResize2fs       = errors.New("resize2fs")
+ 
+ 	// Sandbox lifecycle errors (shared between darwin and linux)
+ 	ErrRegisterState         = errors.New("register VM state")
+@@ -62,4 +62,8 @@ var (
+ 	ErrOpenSource = errors.New("open source")
+ 	ErrCreateDest = errors.New("create dest")
+ 	ErrCopy       = errors.New("copy")
++
++	// Persistence errors
++	ErrGetVM       = errors.New("get VM state")
++	ErrParseConfig = errors.New("parse VM config")
+ )
+diff --git a/pkg/sandbox/exec_relay.go b/pkg/sandbox/exec_relay.go
+index 78a29e5..8bbf770 100644
+--- a/pkg/sandbox/exec_relay.go
++++ b/pkg/sandbox/exec_relay.go
+@@ -26,8 +26,13 @@ const (
+ 	relayMsgExit            uint8 = 7
+ 	relayMsgExecPipe        uint8 = 8
+ 	relayMsgPortForward     uint8 = 9
++	relayMsgUpdateNetwork   uint8 = 10
+ )
+ 
++type relayUpdateNetworkRequest struct {
++	AllowedHosts []string `json:"allowed_hosts"`
++}
++
+ type relayExecRequest struct {
+ 	Command    string `json:"command"`
+ 	WorkingDir string `json:"working_dir,omitempty"`
+@@ -119,6 +124,8 @@ func (r *ExecRelay) handleConn(conn net.Conn) {
+ 		r.handleExecPipe(conn, data)
+ 	case relayMsgPortForward:
+ 		r.handlePortForward(conn, data)
++	case relayMsgUpdateNetwork:
++		r.handleUpdateNetwork(conn, data)
+ 	}
+ }
+ 
+@@ -328,6 +335,21 @@ func (r *ExecRelay) handlePortForward(conn net.Conn, data []byte) {
+ 	}
+ }
+ 
++func (r *ExecRelay) handleUpdateNetwork(conn net.Conn, data []byte) {
++	var req relayUpdateNetworkRequest
++	if err := json.Unmarshal(data, &req); err != nil {
++		_ = sendRelayMsg(conn, relayMsgStderr, []byte(err.Error()))
++		sendRelayExit(conn, 1)
++		return
++	}
++
++	r.sb.UpdateNetworkConfig(&api.NetworkConfig{
++		AllowedHosts: req.AllowedHosts,
++	})
++
++	sendRelayExit(conn, 0)
++}
++
+ // relayWriter forwards writes to the relay connection as messages.
+ type relayWriter struct {
+ 	conn    net.Conn
+@@ -586,3 +608,33 @@ func ExecPipeViaRelay(ctx context.Context, socketPath, command, workingDir, user
+ 		return 1, ctx.Err()
+ 	}
+ }
++
++// UpdateNetworkViaRelay connects to an exec relay socket and updates the network configuration.
++func UpdateNetworkViaRelay(socketPath string, allowedHosts []string) error {
++	conn, err := net.Dial("unix", socketPath)
++	if err != nil {
++		return errx.Wrap(ErrRelayConnect, err)
++	}
++	defer conn.Close()
++
++	req := relayUpdateNetworkRequest{AllowedHosts: allowedHosts}
++	reqData, _ := json.Marshal(req)
++	if err := sendRelayMsg(conn, relayMsgUpdateNetwork, reqData); err != nil {
++		return errx.Wrap(ErrRelaySend, err)
++	}
++
++	msgType, data, err := readRelayMsg(conn)
++	if err != nil {
++		return errx.Wrap(ErrRelayRead, err)
++	}
++
++	if msgType != relayMsgExit {
++		return errx.With(ErrRelayUnexpected, ": %d", msgType)
++	}
++
++	if len(data) >= 4 && binary.BigEndian.Uint32(data) != 0 {
++		return fmt.Errorf("network update failed inside relay")
++	}
++
++	return nil
++}
+diff --git a/pkg/sandbox/sandbox_linux.go b/pkg/sandbox/sandbox_linux.go
+index acf3f35..12940c3 100644
+--- a/pkg/sandbox/sandbox_linux.go
++++ b/pkg/sandbox/sandbox_linux.go
+@@ -71,7 +71,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 	}
+ 
+ 	id := config.GetID()
+-	hostname := config.GetHostname()
+ 	workspace := config.GetWorkspace()
+ 
+ 	stateMgr := state.NewManager()
+@@ -97,13 +96,8 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 	// Create a copy of the rootfs for this VM (copy-on-write if supported)
+ 	vmRootfsPath := stateMgr.Dir(id) + "/rootfs.ext4"
+ 	if err := copyRootfs(opts.RootfsPath, vmRootfsPath); err != nil {
+-		stateMgr.Unregister(id)
+ 		return nil, errx.Wrap(ErrCopyRootfs, err)
+ 	}
+-	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
+-		r.RootfsPath = vmRootfsPath
+-		r.VsockPath = stateMgr.Dir(id) + "/vsock.sock"
+-	})
+ 
+ 	// Inject guest runtime components and resize rootfs
+ 	var diskSizeMB int64
+@@ -111,11 +105,63 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 		diskSizeMB = int64(config.Resources.DiskSizeMB)
+ 	}
+ 	if err := prepareRootfs(vmRootfsPath, diskSizeMB); err != nil {
+-		os.Remove(vmRootfsPath)
+-		stateMgr.Unregister(id)
+ 		return nil, errx.Wrap(ErrPrepareRootfs, err)
+ 	}
+ 
++	return setupSandbox(ctx, id, config, vmRootfsPath, opts.KernelPath)
++}
++
++// Load recreates a sandbox VM from persisted state.
++func Load(ctx context.Context, id string, configOverride *api.Config) (*Sandbox, error) {
++	stateMgr := state.NewManager()
++	vmState, err := stateMgr.Get(id)
++	if err != nil {
++		return nil, errx.Wrap(ErrGetVM, err)
++	}
++
++	config, err := api.ParseConfig(vmState.Config)
++	if err != nil {
++		return nil, errx.Wrap(ErrParseConfig, err)
++	}
++
++	if configOverride != nil {
++		config = config.Merge(configOverride)
++		if err := stateMgr.Register(id, config); err != nil {
++			return nil, errx.Wrap(ErrRegisterState, err)
++		}
++	}
++
++	vmRootfsPath := stateMgr.Dir(id) + "/rootfs.ext4"
++	if _, err := os.Stat(vmRootfsPath); os.IsNotExist(err) {
++		return nil, fmt.Errorf("rootfs not found at %s", vmRootfsPath)
++	}
++
++	return setupSandbox(ctx, id, config, vmRootfsPath, "")
++}
++
++func setupSandbox(ctx context.Context, id string, config *api.Config, vmRootfsPath string, kernelPath string) (sb *Sandbox, retErr error) {
++	hostname := config.GetHostname()
++	workspace := config.GetWorkspace()
++	stateMgr := state.NewManager()
++
++	lifecycleStore := lifecycle.NewStore(stateMgr.Dir(id))
++	if err := lifecycleStore.Init(id, "firecracker", stateMgr.Dir(id)); err != nil {
++		return nil, errx.Wrap(ErrLifecycleInit, err)
++	}
++	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
++		r.StateDir = stateMgr.Dir(id)
++		r.Workspace = workspace
++		r.RootfsPath = vmRootfsPath
++		r.VsockPath = stateMgr.Dir(id) + "/vsock.sock"
++	})
++
++	defer func() {
++		if retErr != nil {
++			_ = lifecycleStore.SetLastError(retErr)
++			_ = lifecycleStore.SetPhase(lifecycle.PhaseCreateFailed)
++		}
++	}()
++
+ 	// Create CAPool early and inject cert into rootfs before VM creation
+ 	needsProxy := config.Network != nil && (len(config.Network.AllowedHosts) > 0 || len(config.Network.Secrets) > 0)
+ 	var caPool *sandboxnet.CAPool
+@@ -138,8 +184,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 	subnetAlloc := state.NewSubnetAllocator()
+ 	subnetInfo, err := subnetAlloc.Allocate(id)
+ 	if err != nil {
+-		os.Remove(vmRootfsPath)
+-		stateMgr.Unregister(id)
+ 		return nil, errx.Wrap(ErrAllocateSubnet, err)
+ 	}
+ 	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
+@@ -150,7 +194,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 
+ 	backend := linux.NewLinuxBackend()
+ 
+-	kernelPath := opts.KernelPath
+ 	if kernelPath == "" {
+ 		kernelPath = DefaultKernelPath()
+ 	}
+@@ -158,8 +201,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 	var extraDisks []vm.DiskConfig
+ 	for _, d := range config.ExtraDisks {
+ 		if err := api.ValidateGuestMount(d.GuestMount); err != nil {
+-			subnetAlloc.Release(id)
+-			stateMgr.Unregister(id)
+ 			return nil, errx.Wrap(ErrInvalidDiskCfg, err)
+ 		}
+ 		extraDisks = append(extraDisks, vm.DiskConfig{
+@@ -193,8 +234,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 
+ 	machine, err := backend.Create(ctx, vmConfig)
+ 	if err != nil {
+-		subnetAlloc.Release(id)
+-		stateMgr.Unregister(id)
+ 		return nil, errx.Wrap(ErrCreateVM, err)
+ 	}
+ 
+@@ -224,8 +263,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 	overlaySnapshots, err := prepareOverlaySnapshots(config, stateMgr.Dir(id))
+ 	if err != nil {
+ 		machine.Close(ctx)
+-		subnetAlloc.Release(id)
+-		stateMgr.Unregister(id)
+ 		return nil, err
+ 	}
+ 
+@@ -254,8 +291,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 		})
+ 		if err != nil {
+ 			machine.Close(ctx)
+-			subnetAlloc.Release(id)
+-			stateMgr.Unregister(id)
+ 			return nil, errx.Wrap(ErrCreateProxy, err)
+ 		}
+ 
+@@ -265,8 +300,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 		if err := fwRules.Setup(); err != nil {
+ 			proxy.Close()
+ 			machine.Close(ctx)
+-			subnetAlloc.Release(id)
+-			stateMgr.Unregister(id)
+ 			return nil, errx.Wrap(ErrFirewallSetup, err)
+ 		}
+ 	}
+@@ -295,15 +328,10 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 	vfsSocketPath := fmt.Sprintf("%s_%d", vmConfig.VsockPath, linux.VsockPortVFS)
+ 	vfsStopFunc, err := vfsServer.ServeUDSBackground(vfsSocketPath)
+ 	if err != nil {
+-		if proxy != nil {
+-			proxy.Close()
+-		}
+-		if fwRules != nil {
+-			fwRules.Cleanup()
++		if err := lifecycleStore.SetPhase(lifecycle.PhaseCreateFailed); err != nil {
++			return nil, errx.Wrap(ErrLifecycleUpdate, err)
+ 		}
+-		machine.Close(ctx)
+-		subnetAlloc.Release(id)
+-		stateMgr.Unregister(id)
++		_ = lifecycleStore.SetLastError(err)
+ 		return nil, errx.Wrap(ErrVFSServer, err)
+ 	}
+ 
+@@ -432,6 +460,16 @@ func (s *Sandbox) ListFiles(ctx context.Context, path string) ([]api.FileInfo, e
+ 	return listFiles(s.vfsRoot, path)
+ }
+ 
++// UpdateNetworkConfig updates the sandbox network configuration.
++func (s *Sandbox) UpdateNetworkConfig(netCfg *api.NetworkConfig) {
++	if s.policy != nil {
++		s.policy.UpdateAllowedHosts(netCfg.AllowedHosts)
++	}
++	s.config.Network = netCfg
++	// Persist updated config to DB
++	_ = s.stateMgr.Register(s.id, s.config)
++}
++
+ // Events returns a channel for receiving sandbox events.
+ func (s *Sandbox) Events() <-chan api.Event {
+ 	return s.events
