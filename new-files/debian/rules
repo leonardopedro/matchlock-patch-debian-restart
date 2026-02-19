@@ -1,0 +1,23 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Use mise to build the binaries
+	mise run build
+
+override_dh_auto_clean:
+	mise run clean || true
+	dh_auto_clean
+
+override_dh_auto_test:
+	# Skip tests during package build
+
+override_dh_auto_install:
+	# Install binaries
+	install -D -m 0755 bin/matchlock debian/matchlock/usr/bin/matchlock
+	install -D -m 0755 bin/guest-init debian/matchlock/usr/bin/guest-init
+	# Install documentation
+	install -D -m 0644 README.md debian/matchlock/usr/share/doc/matchlock/README.md
+	install -D -m 0644 LICENSE debian/matchlock/usr/share/doc/matchlock/copyright

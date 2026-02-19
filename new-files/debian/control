@@ -1,0 +1,14 @@
+Package: matchlock
+Version: 0.1.20
+Section: utils
+Priority: optional
+Maintainer: Leonardo Pedro <leo@example.com>
+Architecture: amd64
+Depends: firecracker (>= 1.0)
+Homepage: https://github.com/leonardopedro/matchlock
+Description: Lightweight container runtime using Firecracker microVMs
+ Matchlock is a container runtime that uses Firecracker microVMs to provide
+ fast, secure, and isolated execution environments. It offers Docker-like
+ simplicity with VM-level security.
+ .
+ This package includes the matchlock CLI and guest initialization binaries.
