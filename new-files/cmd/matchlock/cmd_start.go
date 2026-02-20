@@ -17,19 +17,25 @@ var startCmd = &cobra.Command{
 	Use:   "start [flags] <id>",
 	Short: "Restart a stopped sandbox",
 	Long:  `Restart a stopped sandbox using its existing filesystem and configuration.`,
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MinimumNArgs(1),
 	RunE:  runStart,
 }
 
 func init() {
 	startCmd.Flags().StringSlice("allow-host", nil, "Additional allowed hosts")
+	startCmd.Flags().BoolP("tty", "t", false, "Allocate a pseudo-TTY")
+	startCmd.Flags().BoolP("interactive", "i", false, "Keep STDIN open")
 
 	rootCmd.AddCommand(startCmd)
 }
 
 func runStart(cmd *cobra.Command, args []string) error {
 	id := args[0]
+	execArgs := args[1:]
 	allowHosts, _ := cmd.Flags().GetStringSlice("allow-host")
+	tty, _ := cmd.Flags().GetBool("tty")
+	interactive, _ := cmd.Flags().GetBool("interactive")
+	interactiveMode := tty && interactive
 
 	mgr := state.NewManager()
 	vmState, err := mgr.Get(id)
@@ -61,10 +67,6 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return errx.Wrap(ErrStartSandbox, err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Sandbox %s is running\n", sb.ID())
-	fmt.Fprintf(os.Stderr, "  Connect: matchlock exec %s -it bash\n", sb.ID())
-	fmt.Fprintf(os.Stderr, "  Stop:    matchlock kill %s\n", sb.ID())
-
 	// Start exec relay server so `matchlock exec` can connect
 	execRelay := sandbox.NewExecRelay(sb)
 	execSocketPath := mgr.ExecSocketPath(sb.ID())
@@ -72,6 +74,32 @@ func runStart(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Warning: failed to start exec relay: %v\n", err)
 	}
 	defer execRelay.Stop()
+
+	command := execArgs
+
+	if interactiveMode {
+		exitCode := runInteractive(ctx, sb, command, "")
+		return commandExit(exitCode)
+	}
+
+	if len(command) > 0 {
+		opts := &api.ExecOptions{
+			Stdout: os.Stdout,
+			Stderr: os.Stderr,
+		}
+		if interactive {
+			opts.Stdin = os.Stdin
+		}
+		result, err := sb.Exec(ctx, command, opts)
+		if err != nil {
+			return errx.Wrap(ErrExecCommand, err)
+		}
+		return commandExit(result.ExitCode)
+	}
+
+	fmt.Fprintf(os.Stderr, "Sandbox %s is running\n", sb.ID())
+	fmt.Fprintf(os.Stderr, "  Connect: matchlock exec %s -it bash\n", sb.ID())
+	fmt.Fprintf(os.Stderr, "  Stop:    matchlock kill %s\n", sb.ID())
 
 	// Wait until signal or exit
 	<-ctx.Done()

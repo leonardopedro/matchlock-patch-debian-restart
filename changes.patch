@@ -1,93 +1,319 @@
-diff --git a/.gitignore b/.gitignore
-index 85393b1..ff02ca4 100644
---- a/.gitignore
-+++ b/.gitignore
-@@ -47,3 +47,27 @@ firecracker-*.log
- /tmp/rootfs-build/
- /REQ.md
- /matchlock
+diff --git a/cmd/matchlock/cmd_build.go b/cmd/matchlock/cmd_build.go
+index d438734..1be9699 100644
+--- a/cmd/matchlock/cmd_build.go
++++ b/cmd/matchlock/cmd_build.go
+@@ -347,7 +347,7 @@ exit $RC
+ 		return errx.Wrap(ErrWriteBuildScript, err)
+ 	}
+ 
+-	result, execErr := sb.Exec(ctx, "/workspace/buildkit-run.sh", execOpts)
++	result, execErr := sb.Exec(ctx, []string{"/workspace/buildkit-run.sh"}, execOpts)
+ 	if execErr != nil {
+ 		return errx.Wrap(ErrBuildKitBuild, execErr)
+ 	}
+diff --git a/cmd/matchlock/cmd_exec.go b/cmd/matchlock/cmd_exec.go
+index d4bce32..32cfbb5 100644
+--- a/cmd/matchlock/cmd_exec.go
++++ b/cmd/matchlock/cmd_exec.go
+@@ -9,7 +9,6 @@ import (
+ 	"golang.org/x/term"
+ 
+ 	"github.com/jingkaihe/matchlock/internal/errx"
+-	"github.com/jingkaihe/matchlock/pkg/api"
+ 	"github.com/jingkaihe/matchlock/pkg/sandbox"
+ 	"github.com/jingkaihe/matchlock/pkg/state"
+ )
+@@ -63,7 +62,7 @@ func runExec(cmd *cobra.Command, args []string) error {
+ 		return fmt.Errorf("exec socket not found for %s (was it started with --rm=false?)", vmID)
+ 	}
+ 
+-	command := api.ShellQuoteArgs(cmdArgs)
++	command := cmdArgs
+ 
+ 	ctx, cancel := contextWithSignal(context.Background())
+ 	defer cancel()
+@@ -87,7 +86,7 @@ func runExec(cmd *cobra.Command, args []string) error {
+ 	return nil
+ }
+ 
+-func runExecPipe(ctx context.Context, execSocketPath, command, workdir, user string) error {
++func runExecPipe(ctx context.Context, execSocketPath string, command []string, workdir, user string) error {
+ 	exitCode, err := sandbox.ExecPipeViaRelay(ctx, execSocketPath, command, workdir, user, os.Stdin, os.Stdout, os.Stderr)
+ 	if err != nil {
+ 		return errx.Wrap(ErrPipeExecFailed, err)
+@@ -96,7 +95,7 @@ func runExecPipe(ctx context.Context, execSocketPath, command, workdir, user str
+ 	return nil
+ }
+ 
+-func runExecInteractive(ctx context.Context, execSocketPath, command, workdir, user string) error {
++func runExecInteractive(ctx context.Context, execSocketPath string, command []string, workdir, user string) error {
+ 	if !term.IsTerminal(int(os.Stdin.Fd())) {
+ 		return fmt.Errorf("-it requires a TTY")
+ 	}
+diff --git a/cmd/matchlock/cmd_run.go b/cmd/matchlock/cmd_run.go
+index f78ed11..b21ec6a 100644
+--- a/cmd/matchlock/cmd_run.go
++++ b/cmd/matchlock/cmd_run.go
+@@ -106,6 +106,7 @@ func init() {
+ 	runCmd.Flags().StringP("user", "u", "", "Run as user (uid, uid:gid, or username; overrides image USER)")
+ 	runCmd.Flags().String("entrypoint", "", "Override image ENTRYPOINT")
+ 	runCmd.Flags().Duration("graceful-shutdown", api.DefaultGracefulShutdownPeriod, "Graceful shutdown timeout before force-stopping the VM ")
++	runCmd.Flags().Bool("persistence", false, "Keep filesystem changes between restarts")
+ 	runCmd.MarkFlagRequired("image")
+ 
+ 	viper.BindPFlag("run.image", runCmd.Flags().Lookup("image"))
+@@ -138,6 +139,7 @@ func runRun(cmd *cobra.Command, args []string) error {
+ 	pull, _ := cmd.Flags().GetBool("pull")
+ 	rm, _ := cmd.Flags().GetBool("rm")
+ 	privileged, _ := cmd.Flags().GetBool("privileged")
++	persistence, _ := cmd.Flags().GetBool("persistence")
+ 
+ 	// Resources
+ 	cpus, _ := cmd.Flags().GetInt("cpus")
+@@ -169,13 +171,18 @@ func runRun(cmd *cobra.Command, args []string) error {
+ 		return fmt.Errorf("--mtu must be > 0")
+ 	}
+ 
++	// If persistence is enabled, we should NOT remove the sandbox state by default
++	if persistence && !cmd.Flags().Changed("rm") {
++		rm = false
++	}
 +
-+# New files not in upstream
-+INSTRUCTIONS.md
-+OpenClaw.Dockerfile
-+cmd/matchlock/cmd_network.go.bk
-+cmd/matchlock/cmd_start.go.bk
-+debian.tar
-+dist/
-+firecracker-v1.14.1-x86_64.tgz
-+guest-fused
-+matchlock-dev
-+matchlock_0.1.19_amd64.deb
-+openclaw_debug.tar
-+pkg/api/path.go.bk
-+release-v1.14.1-x86_64/
-+test_extract/
+ 	// Shutdown
+ 	gracefulShutdown, _ := cmd.Flags().GetDuration("graceful-shutdown")
+ 
+ 	user, _ := cmd.Flags().GetString("user")
+ 	entrypoint, _ := cmd.Flags().GetString("entrypoint")
+ 
+-	command := api.ShellQuoteArgs(args)
++	command := args
+ 
+ 	var ctx context.Context
+ 	var cancel context.CancelFunc
+@@ -238,11 +245,11 @@ func runRun(cmd *cobra.Command, args []string) error {
+ 	if imageCfg != nil {
+ 		composed := imageCfg.ComposeCommand(args)
+ 		if len(composed) > 0 {
+-			command = api.ShellQuoteArgs(composed)
++			command = composed
+ 		}
+ 	}
+ 
+-	if rm && command == "" && !interactiveMode {
++	if rm && len(command) == 0 && !interactiveMode {
+ 		return fmt.Errorf("command required (or use --rm=false to start without a command)")
+ 	}
+ 
+@@ -301,8 +308,9 @@ func runRun(cmd *cobra.Command, args []string) error {
+ 	}
+ 
+ 	config := &api.Config{
+-		Image:      imageName,
+-		Privileged: privileged,
++		Image:       imageName,
++		Privileged:  privileged,
++		Persistence: persistence,
+ 		Resources: &api.Resources{
+ 			CPUs:           cpus,
+ 			MemoryMB:       memory,
+@@ -327,29 +335,7 @@ func runRun(cmd *cobra.Command, args []string) error {
+ 	if err != nil {
+ 		return errx.Wrap(ErrCreateSandbox, err)
+ 	}
+-
+-	if err := sb.Start(ctx); err != nil {
+-		closeErr := sb.Close(ctx)
+-		if closeErr != nil {
+-			return errors.Join(errx.Wrap(ErrStartSandbox, err), errx.Wrap(ErrCloseSandbox, closeErr))
+-		}
+-		return errx.Wrap(ErrStartSandbox, err)
+-	}
+-
+-	// Start exec relay server so `matchlock exec` can connect from another process
+-	execRelay := sandbox.NewExecRelay(sb)
+ 	stateMgr := state.NewManager()
+-	execSocketPath := stateMgr.ExecSocketPath(sb.ID())
+-	if err := execRelay.Start(execSocketPath); err != nil {
+-		fmt.Fprintf(os.Stderr, "Warning: failed to start exec relay: %v\n", err)
+-	}
+-	defer execRelay.Stop()
+-
+-	if !rm {
+-		fmt.Fprintf(os.Stderr, "Sandbox %s is running\n", sb.ID())
+-		fmt.Fprintf(os.Stderr, "  Connect: matchlock exec %s -it bash\n", sb.ID())
+-		fmt.Fprintf(os.Stderr, "  Stop:    matchlock kill %s\n", sb.ID())
+-	}
+ 
+ 	closeCtx := func() (context.Context, context.CancelFunc) {
+ 		return context.WithTimeout(context.Background(), gracefulShutdown)
+@@ -363,7 +349,7 @@ func runRun(cmd *cobra.Command, args []string) error {
+ 		if err := sb.Close(c); err != nil {
+ 			errs = append(errs, errx.Wrap(ErrCloseSandbox, err))
+ 		}
+-		if remove {
++		if remove && !persistence {
+ 			if err := stateMgr.Remove(sb.ID()); err != nil {
+ 				errs = append(errs, errx.Wrap(ErrRemoveSandbox, err))
+ 			}
+@@ -374,6 +360,32 @@ func runRun(cmd *cobra.Command, args []string) error {
+ 		return nil
+ 	}
+ 
++	defer func() {
++		if err := cleanupSandbox(rm); err != nil {
++			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
++		}
++	}()
 +
-+# Debian build artifacts
-+debian/.debhelper/
-+debian/matchlock/
-+debian/files
-+debian/*.log
-+debian/*.substvars
-+debian/debhelper-build-stamp
++	if err := sb.Start(ctx); err != nil {
++		return errx.Wrap(ErrStartSandbox, err)
++	}
++
++	// Start exec relay server so `matchlock exec` can connect from another process
++	execRelay := sandbox.NewExecRelay(sb)
++	execSocketPath := stateMgr.ExecSocketPath(sb.ID())
++	if err := execRelay.Start(execSocketPath); err != nil {
++		fmt.Fprintf(os.Stderr, "Warning: failed to start exec relay: %v\n", err)
++	}
++	defer execRelay.Stop()
++
++	if !rm {
++		fmt.Fprintf(os.Stderr, "Sandbox %s is running\n", sb.ID())
++		fmt.Fprintf(os.Stderr, "  Connect: matchlock exec %s -it bash\n", sb.ID())
++		fmt.Fprintf(os.Stderr, "  Stop:    matchlock kill %s\n", sb.ID())
++	}
++
++	// Port forward bindings...
++
+ 	var pfManager *sandbox.PortForwardManager
+ 	if len(portForwards) > 0 {
+ 		pfManager, err = sb.StartPortForwards(ctx, addresses, portForwards)
+@@ -395,17 +407,14 @@ func runRun(cmd *cobra.Command, args []string) error {
+ 	if interactiveMode {
+ 		exitCode := runInteractive(ctx, sb, command, workdir)
+ 		if rm {
+-			if err := cleanupSandbox(true); err != nil {
+-				return err
+-			}
+ 			return commandExit(exitCode)
+ 		}
+ 		// Keep sandbox alive for follow-up `matchlock exec` sessions.
+ 		<-ctx.Done()
+-		return cleanupSandbox(false)
++		return nil
+ 	}
+ 
+-	if command != "" {
++	if len(command) > 0 {
+ 		opts := &api.ExecOptions{
+ 			Stdout: os.Stdout,
+ 			Stderr: os.Stderr,
+@@ -418,18 +427,10 @@ func runRun(cmd *cobra.Command, args []string) error {
+ 		}
+ 		result, err := sb.Exec(ctx, command, opts)
+ 		if err != nil {
+-			if rm {
+-				if cleanupErr := cleanupSandbox(true); cleanupErr != nil {
+-					return errors.Join(errx.Wrap(ErrExecCommand, err), cleanupErr)
+-				}
+-			}
+ 			return errx.Wrap(ErrExecCommand, err)
+ 		}
+ 
+ 		if rm {
+-			if err := cleanupSandbox(true); err != nil {
+-				return err
+-			}
+ 			return commandExit(result.ExitCode)
+ 		}
+ 	}
+@@ -437,13 +438,13 @@ func runRun(cmd *cobra.Command, args []string) error {
+ 	if !rm {
+ 		// Block until signal — keeps the sandbox alive for `matchlock exec`
+ 		<-ctx.Done()
+-		return cleanupSandbox(false)
++		return nil
+ 	}
+ 
+ 	return nil
+ }
+ 
+-func runInteractive(ctx context.Context, sb *sandbox.Sandbox, command, workdir string) int {
++func runInteractive(ctx context.Context, sb *sandbox.Sandbox, command []string, workdir string) int {
+ 	if !term.IsTerminal(int(os.Stdin.Fd())) {
+ 		fmt.Fprintln(os.Stderr, "Error: -it requires a TTY")
+ 		return 1
 diff --git a/cmd/matchlock/errors.go b/cmd/matchlock/errors.go
-index bb82a9f..56f57b1 100644
+index bb82a9f..3f296a0 100644
 --- a/cmd/matchlock/errors.go
 +++ b/cmd/matchlock/errors.go
-@@ -34,6 +34,7 @@ var (
+@@ -34,6 +34,9 @@ var (
  	ErrPipeExecFailed  = errors.New("pipe exec failed")
  	ErrSetRawMode      = errors.New("setting raw mode")
  	ErrInteractiveExec = errors.New("interactive exec failed")
++	ErrRegisterState   = errors.New("register VM state")
++	ErrParseConfig     = errors.New("parse sandbox config")
 +	ErrVMRunning       = errors.New("VM is already running")
  )
  
  // Pull errors
-@@ -61,6 +62,8 @@ var (
- 	ErrCloseSandbox           = errors.New("closing sandbox")
- 	ErrRemoveSandbox          = errors.New("removing sandbox")
- 	ErrExecCommand            = errors.New("executing command")
-+	ErrRegisterState         = errors.New("register VM state")
-+	ErrParseConfig           = errors.New("parse VM config")
- )
+diff --git a/internal/guestruntime/agent/main.go b/internal/guestruntime/agent/main.go
+index 997d3ef..9053b21 100644
+--- a/internal/guestruntime/agent/main.go
++++ b/internal/guestruntime/agent/main.go
+@@ -315,7 +315,7 @@ func handleExecBatch(fd int, data []byte) {
+ 	wipeBytes(data)
  
- // Setup errors (Linux)
+ 	var stdout, stderr bytes.Buffer
+-	cmd := exec.Command("sh", "-c", req.Command)
++	cmd := exec.Command(req.Command, req.Args...)
+ 	cmd.Stdout = &stdout
+ 	cmd.Stderr = &stderr
+ 
+@@ -374,7 +374,7 @@ func handleExecStreamBatch(fd int, data []byte) {
+ 
+ 	wipeBytes(data)
+ 
+-	cmd := exec.Command("sh", "-c", req.Command)
++	cmd := exec.Command(req.Command, req.Args...)
+ 
+ 	stdoutPipe, err := cmd.StdoutPipe()
+ 	if err != nil {
+@@ -474,7 +474,7 @@ func handleExecPipe(fd int, data []byte) {
+ 
+ 	wipeBytes(data)
+ 
+-	cmd := exec.Command("sh", "-c", req.Command)
++	cmd := exec.Command(req.Command, req.Args...)
+ 
+ 	stdinPipe, err := cmd.StdinPipe()
+ 	if err != nil {
+@@ -630,7 +630,7 @@ func handleExecTTY(fd int, data []byte) {
+ 	// Wipe the raw request data from memory
+ 	wipeBytes(data)
+ 
+-	cmd := exec.Command("sh", "-c", req.Command)
++	cmd := exec.Command(req.Command, req.Args...)
+ 
+ 	if req.WorkingDir != "" {
+ 		cmd.Dir = req.WorkingDir
 diff --git a/mise.toml b/mise.toml
-index c78089a..e6d906d 100644
+index c78089a..805d8de 100644
 --- a/mise.toml
 +++ b/mise.toml
-@@ -13,6 +13,7 @@ _.path = ["~/go/bin"]
- KERNEL_VERSION = "6.1.137"
- OUTPUT_DIR = "{{env.HOME}}/.cache/matchlock"
- REGISTRY = "ghcr.io/jingkaihe/matchlock"
-+FIRECRACKER_VERSION = "1.14.1"
- 
- VERSION = "{{exec(command='cat VERSION.txt')}}"
- GIT_COMMIT = "{{exec(command='echo ${GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}')}}"
-@@ -256,9 +257,14 @@ sudo cp bin/matchlock /usr/local/bin/matchlock
- echo "Installed matchlock to /usr/local/bin"
+@@ -257,8 +257,58 @@ echo "Installed matchlock to /usr/local/bin"
  """
  
-+[tasks."build:firecracker:deb"]
-+description = "Build Firecracker Debian package from source"
-+run = "./scripts/build-firecracker-deb.sh"
-+
  [tasks."install:firecracker"]
 -description = "Install Firecracker binary"
 -run = "./scripts/install-firecracker.sh"
 +description = "Install Firecracker (builds debian package from source)"
 +depends = ["build:firecracker:deb"]
 +run = "sudo dpkg -i firecracker_${FIRECRACKER_VERSION}_$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/').deb"
- 
- [tasks.images]
- description = "Build kernel + rootfs"
-@@ -384,3 +390,55 @@ git push origin "v$VERSION"
- echo "Tag v$VERSION pushed successfully!"
- echo "GitHub Actions will automatically create a release with binaries."
- """
 +
-+# =============================================================================
-+# Debian package tasks
-+# =============================================================================
++[tasks."build:firecracker:deb"]
++description = "Build Firecracker Debian package from source"
++run = "./scripts/build-firecracker-deb.sh"
 +
 +[tasks."build:deb"]
 +description = "Build Debian package using mise for compilation (direct dpkg-deb approach)"
@@ -95,157 +321,304 @@ index c78089a..e6d906d 100644
 +#!/usr/bin/env bash
 +set -e
 +
-+# VERSION is provided by mise env
++# Package metadata
++PKG_NAME="matchlock"
 +ARCH=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
++PKG_DIR="${PKG_NAME}_${VERSION}_${ARCH}"
 +
-+echo "Building Debian package for matchlock v$VERSION ($ARCH)..."
++echo "Building Debian package for ${PKG_NAME} v${VERSION} (${ARCH})..."
 +
-+# Build binaries first
++# 1. Build binaries first using existing mise task
 +mise run build
 +
-+# Prepare package root
-+PKG_ROOT="dist/pkg-root"
-+rm -rf "$PKG_ROOT"
-+mkdir -p "$PKG_ROOT/usr/bin"
-+mkdir -p "$PKG_ROOT/usr/share/doc/matchlock"
-+mkdir -p "$PKG_ROOT/DEBIAN"
++# 2. Create Debian directory structure
++mkdir -p "${PKG_DIR}/usr/local/bin"
++mkdir -p "${PKG_DIR}/DEBIAN"
 +
-+# Copy binaries
-+cp bin/matchlock "$PKG_ROOT/usr/bin/matchlock"
-+cp bin/guest-init "$PKG_ROOT/usr/bin/guest-init"
++# 3. Copy binaries
++cp bin/matchlock "${PKG_DIR}/usr/local/bin/"
++cp bin/guest-init "${PKG_DIR}/usr/local/bin/matchlock-guest-init"
 +
-+# Copy documentation & metadata
-+cp README.md "$PKG_ROOT/usr/share/doc/matchlock/README.md"
-+cp LICENSE "$PKG_ROOT/usr/share/doc/matchlock/copyright"
-+[ -f debian/changelog ] && cp debian/changelog "$PKG_ROOT/usr/share/doc/matchlock/changelog"
++# 4. Generate control file
++cat > "${PKG_DIR}/DEBIAN/control" << EOF
++Package: ${PKG_NAME}
++Version: ${VERSION}
++Section: utils
++Priority: optional
++Architecture: ${ARCH}
++Maintainer: Matchlock Maintainers <maintainers@matchlock.io>
++Description: Matchlock VM-based execution engine.
++ Small, fast, and secure VM-based execution for sensitive workloads.
++EOF
 +
-+# Create DEBIAN/ metadata
-+cp debian/control "$PKG_ROOT/DEBIAN/control"
-+if [ -f debian/postinst ]; then
-+  cp debian/postinst "$PKG_ROOT/DEBIAN/postinst"
-+  chmod 755 "$PKG_ROOT/DEBIAN/postinst"
-+fi
++# 5. Build the package
++dpkg-deb --build "${PKG_DIR}"
 +
-+# Build the package
-+dpkg-deb --build "$PKG_ROOT" "matchlock_${VERSION}_${ARCH}.deb"
++# 6. Cleanup
++rm -rf "${PKG_DIR}"
 +
-+echo ""
-+echo "============================================"
-+echo "Matchlock Debian package built successfully!"
-+echo "============================================"
-+echo ""
-+echo "Package file: matchlock_${VERSION}_${ARCH}.deb"
++echo "Created: ${PKG_DIR}.deb"
 +"""
+ 
+ [tasks.images]
+ description = "Build kernel + rootfs"
+diff --git a/pkg/api/config.go b/pkg/api/config.go
+index 8414528..2d72956 100644
+--- a/pkg/api/config.go
++++ b/pkg/api/config.go
+@@ -30,15 +30,17 @@ type ImageConfig struct {
+ }
+ 
+ type Config struct {
+-	ID         string            `json:"id,omitempty"`
+-	Image      string            `json:"image,omitempty"`
+-	Privileged bool              `json:"privileged,omitempty"`
+-	Resources  *Resources        `json:"resources,omitempty"`
+-	Network    *NetworkConfig    `json:"network,omitempty"`
+-	VFS        *VFSConfig        `json:"vfs,omitempty"`
+-	Env        map[string]string `json:"env,omitempty"`
+-	ExtraDisks []DiskMount       `json:"extra_disks,omitempty"`
+-	ImageCfg   *ImageConfig      `json:"image_config,omitempty"`
++	ID          string            `json:"id,omitempty"`
++	Image       string            `json:"image,omitempty"`
++	Privileged  bool              `json:"privileged,omitempty"`
++	Persistence bool              `json:"persistence,omitempty"`
++	Resources   *Resources        `json:"resources,omitempty"`
++	Network     *NetworkConfig    `json:"network,omitempty"`
++	VFS         *VFSConfig        `json:"vfs,omitempty"`
++	Env         map[string]string `json:"env,omitempty"`
++	ExtraDisks  []DiskMount       `json:"extra_disks,omitempty"`
++	ImageCfg    *ImageConfig      `json:"image_config,omitempty"`
++	KernelPath  string            `json:"kernel_path,omitempty"`
+ }
+ 
+ // DiskMount describes a persistent ext4 disk image to attach as a block device.
+@@ -224,6 +226,9 @@ func (c *Config) Merge(other *Config) *Config {
+ 	if other.Privileged {
+ 		result.Privileged = true
+ 	}
++	if other.Persistence {
++		result.Persistence = true
++	}
+ 	if other.Env != nil {
+ 		result.Env = other.Env
+ 	}
+@@ -233,6 +238,9 @@ func (c *Config) Merge(other *Config) *Config {
+ 	if other.ImageCfg != nil {
+ 		result.ImageCfg = other.ImageCfg
+ 	}
++	if other.KernelPath != "" {
++		result.KernelPath = other.KernelPath
++	}
+ 	return &result
+ }
+ 
+diff --git a/pkg/api/vm.go b/pkg/api/vm.go
+index e541829..21937db 100644
+--- a/pkg/api/vm.go
++++ b/pkg/api/vm.go
+@@ -36,7 +36,7 @@ type VM interface {
+ 	Config() *Config
+ 	Start(ctx context.Context) error
+ 	Stop(ctx context.Context) error
+-	Exec(ctx context.Context, command string, opts *ExecOptions) (*ExecResult, error)
++	Exec(ctx context.Context, args []string, opts *ExecOptions) (*ExecResult, error)
+ 	WriteFile(ctx context.Context, path string, content []byte, mode uint32) error
+ 	ReadFile(ctx context.Context, path string) ([]byte, error)
+ 	ListFiles(ctx context.Context, path string) ([]FileInfo, error)
 diff --git a/pkg/policy/engine.go b/pkg/policy/engine.go
-index fffb629..b89b04f 100644
+index fffb629..639e706 100644
 --- a/pkg/policy/engine.go
 +++ b/pkg/policy/engine.go
-@@ -6,11 +6,13 @@ import (
- 	"net"
- 	"net/http"
- 	"strings"
-+	"sync"
- 
- 	"github.com/jingkaihe/matchlock/pkg/api"
- )
- 
- type Engine struct {
-+	mu           sync.RWMutex
- 	config       *api.NetworkConfig
- 	placeholders map[string]string
- }
-@@ -55,6 +57,9 @@ func (e *Engine) GetPlaceholders() map[string]string {
- }
- 
- func (e *Engine) IsHostAllowed(host string) bool {
-+	e.mu.RLock()
-+	defer e.mu.RUnlock()
-+
- 	host = strings.Split(host, ":")[0]
- 
- 	if e.config.BlockPrivateIPs {
-@@ -76,7 +81,16 @@ func (e *Engine) IsHostAllowed(host string) bool {
- 	return false
+@@ -54,6 +54,10 @@ func (e *Engine) GetPlaceholders() map[string]string {
+ 	return result
  }
  
 +func (e *Engine) UpdateAllowedHosts(hosts []string) {
-+	e.mu.Lock()
-+	defer e.mu.Unlock()
 +	e.config.AllowedHosts = hosts
 +}
 +
- func (e *Engine) OnRequest(req *http.Request, host string) (*http.Request, error) {
-+	e.mu.RLock()
-+	defer e.mu.RUnlock()
-+
+ func (e *Engine) IsHostAllowed(host string) bool {
  	host = strings.Split(host, ":")[0]
  
- 	for name, secret := range e.config.Secrets {
-@@ -97,6 +111,8 @@ func (e *Engine) OnResponse(resp *http.Response, req *http.Request, host string)
+diff --git a/pkg/rpc/handler.go b/pkg/rpc/handler.go
+index c69e49e..c117443 100644
+--- a/pkg/rpc/handler.go
++++ b/pkg/rpc/handler.go
+@@ -53,7 +53,7 @@ type VM interface {
+ 	Config() *api.Config
+ 	Start(ctx context.Context) error
+ 	Stop(ctx context.Context) error
+-	Exec(ctx context.Context, command string, opts *api.ExecOptions) (*api.ExecResult, error)
++	Exec(ctx context.Context, command []string, opts *api.ExecOptions) (*api.ExecResult, error)
+ 	WriteFile(ctx context.Context, path string, content []byte, mode uint32) error
+ 	ReadFile(ctx context.Context, path string) ([]byte, error)
+ 	ListFiles(ctx context.Context, path string) ([]api.FileInfo, error)
+@@ -298,9 +298,9 @@ func (h *Handler) handleExec(ctx context.Context, req *Request) *Response {
+ 	}
+ 
+ 	var params struct {
+-		Command    string `json:"command"`
+-		WorkingDir string `json:"working_dir,omitempty"`
+-		User       string `json:"user,omitempty"`
++		Args       []string `json:"args"`
++		WorkingDir string   `json:"working_dir,omitempty"`
++		User       string   `json:"user,omitempty"`
+ 	}
+ 	if err := json.Unmarshal(req.Params, &params); err != nil {
+ 		return &Response{
+@@ -315,7 +315,7 @@ func (h *Handler) handleExec(ctx context.Context, req *Request) *Response {
+ 		User:       params.User,
+ 	}
+ 
+-	result, err := vm.Exec(ctx, params.Command, opts)
++	result, err := vm.Exec(ctx, params.Args, opts)
+ 	if err != nil {
+ 		code := ErrCodeExecFailed
+ 		if ctx.Err() != nil {
+@@ -362,9 +362,9 @@ func (h *Handler) handleExecStream(ctx context.Context, req *Request) *Response
+ 	}
+ 
+ 	var params struct {
+-		Command    string `json:"command"`
+-		WorkingDir string `json:"working_dir,omitempty"`
+-		User       string `json:"user,omitempty"`
++		Args       []string `json:"args"`
++		WorkingDir string   `json:"working_dir,omitempty"`
++		User       string   `json:"user,omitempty"`
+ 	}
+ 	if err := json.Unmarshal(req.Params, &params); err != nil {
+ 		return &Response{
+@@ -385,7 +385,7 @@ func (h *Handler) handleExecStream(ctx context.Context, req *Request) *Response
+ 		Stderr:     stderrWriter,
+ 	}
+ 
+-	result, err := vm.Exec(ctx, params.Command, opts)
++	result, err := vm.Exec(ctx, params.Args, opts)
+ 	if err != nil {
+ 		code := ErrCodeExecFailed
+ 		if ctx.Err() != nil {
+diff --git a/pkg/rpc/handler_test.go b/pkg/rpc/handler_test.go
+index 4df0bff..3434fba 100644
+--- a/pkg/rpc/handler_test.go
++++ b/pkg/rpc/handler_test.go
+@@ -21,7 +21,7 @@ import (
+ 
+ type mockVM struct {
+ 	id       string
+-	execFunc func(ctx context.Context, command string, opts *api.ExecOptions) (*api.ExecResult, error)
++	execFunc func(ctx context.Context, command []string, opts *api.ExecOptions) (*api.ExecResult, error)
  }
  
- func (e *Engine) isSecretAllowedForHost(secretName, host string) bool {
-+	// Note: Caller (OnRequest) already holds RLock
-+
- 	secret, ok := e.config.Secrets[secretName]
- 	if !ok {
- 		return false
+ func (m *mockVM) ID() string                                                { return m.id }
+@@ -34,7 +34,7 @@ func (m *mockVM) ListFiles(context.Context, string) ([]api.FileInfo, error) { re
+ func (m *mockVM) Events() <-chan api.Event                                  { return make(chan api.Event) }
+ func (m *mockVM) Close(context.Context) error                               { return nil }
+ 
+-func (m *mockVM) Exec(ctx context.Context, command string, opts *api.ExecOptions) (*api.ExecResult, error) {
++func (m *mockVM) Exec(ctx context.Context, command []string, opts *api.ExecOptions) (*api.ExecResult, error) {
+ 	if m.execFunc != nil {
+ 		return m.execFunc(ctx, command, opts)
+ 	}
+@@ -136,7 +136,7 @@ func TestHandlerConcurrentExec(t *testing.T) {
+ 
+ 	vm := &mockVM{
+ 		id: "vm-test",
+-		execFunc: func(ctx context.Context, command string, opts *api.ExecOptions) (*api.ExecResult, error) {
++		execFunc: func(ctx context.Context, command []string, opts *api.ExecOptions) (*api.ExecResult, error) {
+ 			mu.Lock()
+ 			running++
+ 			if running > maxRunning {
+@@ -150,7 +150,7 @@ func TestHandlerConcurrentExec(t *testing.T) {
+ 			running--
+ 			mu.Unlock()
+ 
+-			return &api.ExecResult{Stdout: []byte(command)}, nil
++			return &api.ExecResult{Stdout: []byte(strings.Join(command, " "))}, nil
+ 		},
+ 	}
+ 
+@@ -161,9 +161,9 @@ func TestHandlerConcurrentExec(t *testing.T) {
+ 	msg := rpc.read()
+ 	require.Nil(t, msg.Error, "create failed")
+ 
+-	rpc.send("exec", 10, map[string]string{"command": "cmd-a"})
+-	rpc.send("exec", 11, map[string]string{"command": "cmd-b"})
+-	rpc.send("exec", 12, map[string]string{"command": "cmd-c"})
++	rpc.send("exec", 10, map[string]interface{}{"args": []string{"cmd-a"}})
++	rpc.send("exec", 11, map[string]interface{}{"args": []string{"cmd-b"}})
++	rpc.send("exec", 12, map[string]interface{}{"args": []string{"cmd-c"}})
+ 
+ 	results := make(map[uint64]string)
+ 	for i := 0; i < 3; i++ {
+@@ -190,7 +190,7 @@ func TestHandlerConcurrentExec(t *testing.T) {
+ func TestHandlerExecStream(t *testing.T) {
+ 	vm := &mockVM{
+ 		id: "vm-test",
+-		execFunc: func(ctx context.Context, command string, opts *api.ExecOptions) (*api.ExecResult, error) {
++		execFunc: func(ctx context.Context, command []string, opts *api.ExecOptions) (*api.ExecResult, error) {
+ 			if opts.Stdout != nil {
+ 				opts.Stdout.Write([]byte("chunk1"))
+ 				opts.Stdout.Write([]byte("chunk2"))
+@@ -208,7 +208,7 @@ func TestHandlerExecStream(t *testing.T) {
+ 	rpc.send("create", 1, map[string]string{"image": "alpine:latest"})
+ 	rpc.read()
+ 
+-	rpc.send("exec_stream", 2, map[string]string{"command": "test"})
++	rpc.send("exec_stream", 2, map[string]interface{}{"args": []string{"test"}})
+ 
+ 	var notifications []*rpcMsg
+ 	var final *rpcMsg
 diff --git a/pkg/sandbox/errors.go b/pkg/sandbox/errors.go
-index 0637926..07fae4b 100644
+index 0637926..3e9c24c 100644
 --- a/pkg/sandbox/errors.go
 +++ b/pkg/sandbox/errors.go
-@@ -14,16 +14,16 @@ var (
- 	ErrRelayProxy      = errors.New("relay port-forward proxy")
- 
- 	// Rootfs errors
--	ErrGuestAgent   = errors.New("guest-agent not found")
--	ErrGuestFused   = errors.New("guest-fused not found")
-+	ErrGuestAgent      = errors.New("guest-agent not found")
-+	ErrGuestFused      = errors.New("guest-fused not found")
- 	ErrGuestInit    = errors.New("guest-init not found")
- 	ErrResizeRootfs = errors.New("resize rootfs")
--	ErrCreateTemp   = errors.New("create temp file")
--	ErrWriteTemp    = errors.New("write temp file")
--	ErrDebugfs      = errors.New("debugfs")
--	ErrStatRootfs   = errors.New("stat rootfs")
--	ErrTruncate     = errors.New("truncate rootfs")
--	ErrResize2fs    = errors.New("resize2fs")
-+	ErrCreateTemp      = errors.New("create temp file")
-+	ErrWriteTemp       = errors.New("write temp file")
-+	ErrDebugfs         = errors.New("debugfs")
-+	ErrStatRootfs      = errors.New("stat rootfs")
-+	ErrTruncate        = errors.New("truncate rootfs")
-+	ErrResize2fs       = errors.New("resize2fs")
- 
- 	// Sandbox lifecycle errors (shared between darwin and linux)
- 	ErrRegisterState         = errors.New("register VM state")
-@@ -62,4 +62,8 @@ var (
- 	ErrOpenSource = errors.New("open source")
- 	ErrCreateDest = errors.New("create dest")
- 	ErrCopy       = errors.New("copy")
-+
-+	// Persistence errors
-+	ErrGetVM       = errors.New("get VM state")
-+	ErrParseConfig = errors.New("parse VM config")
- )
+@@ -32,6 +32,7 @@ var (
+ 	ErrCopyRootfs            = errors.New("copy rootfs")
+ 	ErrPrepareRootfs         = errors.New("prepare rootfs")
+ 	ErrInjectCACert          = errors.New("inject CA cert into rootfs")
++	ErrParseConfig           = errors.New("parse sandbox config")
+ 	ErrInvalidDiskCfg        = errors.New("invalid extra disk config")
+ 	ErrCreateVM              = errors.New("create VM")
+ 	ErrCreateProxy           = errors.New("create transparent proxy")
 diff --git a/pkg/sandbox/exec_relay.go b/pkg/sandbox/exec_relay.go
-index 78a29e5..8bbf770 100644
+index 78a29e5..e1603d4 100644
 --- a/pkg/sandbox/exec_relay.go
 +++ b/pkg/sandbox/exec_relay.go
-@@ -26,8 +26,13 @@ const (
+@@ -26,20 +26,25 @@ const (
  	relayMsgExit            uint8 = 7
  	relayMsgExecPipe        uint8 = 8
  	relayMsgPortForward     uint8 = 9
 +	relayMsgUpdateNetwork   uint8 = 10
  )
  
-+type relayUpdateNetworkRequest struct {
-+	AllowedHosts []string `json:"allowed_hosts"`
+ type relayExecRequest struct {
+-	Command    string `json:"command"`
+-	WorkingDir string `json:"working_dir,omitempty"`
+-	User       string `json:"user,omitempty"`
++	Args       []string `json:"args"`
++	WorkingDir string   `json:"working_dir,omitempty"`
++	User       string   `json:"user,omitempty"`
+ }
+ 
+ type relayExecInteractiveRequest struct {
+-	Command    string `json:"command"`
+-	WorkingDir string `json:"working_dir,omitempty"`
+-	User       string `json:"user,omitempty"`
+-	Rows       uint16 `json:"rows"`
+-	Cols       uint16 `json:"cols"`
++	Args       []string `json:"args"`
++	WorkingDir string   `json:"working_dir,omitempty"`
++	User       string   `json:"user,omitempty"`
++	Rows       uint16   `json:"rows"`
++	Cols       uint16   `json:"cols"`
 +}
 +
- type relayExecRequest struct {
- 	Command    string `json:"command"`
- 	WorkingDir string `json:"working_dir,omitempty"`
++type relayUpdateNetworkRequest struct {
++	AllowedHosts []string `json:"allowed_hosts"`
+ }
+ 
+ type relayPortForwardRequest struct {
 @@ -119,6 +124,8 @@ func (r *ExecRelay) handleConn(conn net.Conn) {
  		r.handleExecPipe(conn, data)
  	case relayMsgPortForward:
@@ -255,14 +628,40 @@ index 78a29e5..8bbf770 100644
  	}
  }
  
-@@ -328,6 +335,21 @@ func (r *ExecRelay) handlePortForward(conn net.Conn, data []byte) {
- 	}
+@@ -147,7 +154,7 @@ func (r *ExecRelay) handleExec(conn net.Conn, data []byte) {
+ 		cancel()
+ 	}()
+ 
+-	result, err := r.sb.Exec(ctx, req.Command, opts)
++	result, err := r.sb.Exec(ctx, req.Args, opts)
+ 	if err != nil {
+ 		sendRelayResult(conn, &relayExecResult{ExitCode: 1, Error: err.Error()})
+ 		return
+@@ -201,7 +208,7 @@ func (r *ExecRelay) handleExecInteractive(conn net.Conn, data []byte) {
+ 	resizeCh := make(chan [2]uint16, 1)
+ 
+ 	exitCode, err := interactiveMachine.ExecInteractive(
+-		context.Background(), req.Command, opts,
++		context.Background(), req.Args, opts,
+ 		req.Rows, req.Cols,
+ 		stdinReader, stdoutWriter, resizeCh,
+ 	)
+@@ -258,7 +265,7 @@ func (r *ExecRelay) handleExecPipe(conn net.Conn, data []byte) {
+ 		}
+ 	}()
+ 
+-	result, err := r.sb.Exec(ctx, req.Command, opts)
++	result, err := r.sb.Exec(ctx, req.Args, opts)
+ 
+ 	exitCode := 0
+ 	if err != nil {
+@@ -270,6 +277,19 @@ func (r *ExecRelay) handleExecPipe(conn net.Conn, data []byte) {
+ 	sendRelayExit(conn, exitCode)
  }
  
 +func (r *ExecRelay) handleUpdateNetwork(conn net.Conn, data []byte) {
 +	var req relayUpdateNetworkRequest
 +	if err := json.Unmarshal(data, &req); err != nil {
-+		_ = sendRelayMsg(conn, relayMsgStderr, []byte(err.Error()))
 +		sendRelayExit(conn, 1)
 +		return
 +	}
@@ -270,19 +669,71 @@ index 78a29e5..8bbf770 100644
 +	r.sb.UpdateNetworkConfig(&api.NetworkConfig{
 +		AllowedHosts: req.AllowedHosts,
 +	})
-+
 +	sendRelayExit(conn, 0)
 +}
 +
- // relayWriter forwards writes to the relay connection as messages.
- type relayWriter struct {
- 	conn    net.Conn
-@@ -586,3 +608,33 @@ func ExecPipeViaRelay(ctx context.Context, socketPath, command, workingDir, user
+ func (r *ExecRelay) handlePortForward(conn net.Conn, data []byte) {
+ 	var req relayPortForwardRequest
+ 	if err := json.Unmarshal(data, &req); err != nil {
+@@ -390,7 +410,7 @@ func sendRelayExit(conn net.Conn, code int) {
+ 
+ // ExecViaRelay connects to an exec relay socket and runs a command.
+ // The context controls the lifetime — if cancelled, the connection is closed.
+-func ExecViaRelay(ctx context.Context, socketPath, command, workingDir, user string) (*api.ExecResult, error) {
++func ExecViaRelay(ctx context.Context, socketPath string, args []string, workingDir, user string) (*api.ExecResult, error) {
+ 	conn, err := net.Dial("unix", socketPath)
+ 	if err != nil {
+ 		return nil, errx.Wrap(ErrRelayConnect, err)
+@@ -408,7 +428,7 @@ func ExecViaRelay(ctx context.Context, socketPath, command, workingDir, user str
+ 		}
+ 	}()
+ 
+-	req := relayExecRequest{Command: command, WorkingDir: workingDir, User: user}
++	req := relayExecRequest{Args: args, WorkingDir: workingDir, User: user}
+ 	reqData, _ := json.Marshal(req)
+ 	if err := sendRelayMsg(conn, relayMsgExec, reqData); err != nil {
+ 		if ctx.Err() != nil {
+@@ -450,7 +470,7 @@ func ExecViaRelay(ctx context.Context, socketPath, command, workingDir, user str
+ }
+ 
+ // ExecInteractiveViaRelay connects to an exec relay socket and runs an interactive command.
+-func ExecInteractiveViaRelay(ctx context.Context, socketPath, command, workingDir, user string, rows, cols uint16, stdin io.Reader, stdout io.Writer) (int, error) {
++func ExecInteractiveViaRelay(ctx context.Context, socketPath string, args []string, workingDir, user string, rows, cols uint16, stdin io.Reader, stdout io.Writer) (int, error) {
+ 	conn, err := net.Dial("unix", socketPath)
+ 	if err != nil {
+ 		return 1, errx.Wrap(ErrRelayConnect, err)
+@@ -458,7 +478,7 @@ func ExecInteractiveViaRelay(ctx context.Context, socketPath, command, workingDi
+ 	defer conn.Close()
+ 
+ 	req := relayExecInteractiveRequest{
+-		Command:    command,
++		Args:       args,
+ 		WorkingDir: workingDir,
+ 		User:       user,
+ 		Rows:       rows,
+@@ -520,14 +540,14 @@ func ExecInteractiveViaRelay(ctx context.Context, socketPath, command, workingDi
+ 
+ // ExecPipeViaRelay connects to an exec relay socket and runs a command with
+ // bidirectional stdin/stdout/stderr piping (no PTY).
+-func ExecPipeViaRelay(ctx context.Context, socketPath, command, workingDir, user string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
++func ExecPipeViaRelay(ctx context.Context, socketPath string, args []string, workingDir, user string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+ 	conn, err := net.Dial("unix", socketPath)
+ 	if err != nil {
+ 		return 1, errx.Wrap(ErrRelayConnect, err)
+ 	}
+ 	defer conn.Close()
+ 
+-	req := relayExecRequest{Command: command, WorkingDir: workingDir, User: user}
++	req := relayExecRequest{Args: args, WorkingDir: workingDir, User: user}
+ 	reqData, _ := json.Marshal(req)
+ 	if err := sendRelayMsg(conn, relayMsgExecPipe, reqData); err != nil {
+ 		return 1, errx.Wrap(ErrRelaySend, err)
+@@ -586,3 +606,32 @@ func ExecPipeViaRelay(ctx context.Context, socketPath, command, workingDir, user
  		return 1, ctx.Err()
  	}
  }
 +
-+// UpdateNetworkViaRelay connects to an exec relay socket and updates the network configuration.
++// UpdateNetworkViaRelay sends a request to the exec relay to update network config.
 +func UpdateNetworkViaRelay(socketPath string, allowedHosts []string) error {
 +	conn, err := net.Dial("unix", socketPath)
 +	if err != nil {
@@ -296,114 +747,216 @@ index 78a29e5..8bbf770 100644
 +		return errx.Wrap(ErrRelaySend, err)
 +	}
 +
++	// Exit message signals completion (or error)
 +	msgType, data, err := readRelayMsg(conn)
 +	if err != nil {
 +		return errx.Wrap(ErrRelayRead, err)
 +	}
-+
 +	if msgType != relayMsgExit {
 +		return errx.With(ErrRelayUnexpected, ": %d", msgType)
 +	}
-+
 +	if len(data) >= 4 && binary.BigEndian.Uint32(data) != 0 {
-+		return fmt.Errorf("network update failed inside relay")
++		return fmt.Errorf("network update failed with exit code %d", binary.BigEndian.Uint32(data))
 +	}
 +
 +	return nil
 +}
+diff --git a/pkg/sandbox/paths.go b/pkg/sandbox/paths.go
+index 6ae44fe..cb2de6e 100644
+--- a/pkg/sandbox/paths.go
++++ b/pkg/sandbox/paths.go
+@@ -89,17 +89,27 @@ func findGuestBinary(name, envVar string) string {
+ 	execPath, _ := os.Executable()
+ 	execDir := filepath.Dir(execPath)
+ 
+-	paths := []string{
+-		os.Getenv(envVar),
+-		filepath.Join(execDir, name),
+-		filepath.Join(home, ".cache/matchlock", name),
++	// Try both local name and matchlock-prefixed name (used in Debian package)
++	searchNames := []string{name, "matchlock-" + name}
++	searchDirs := []string{
++		execDir,
++		filepath.Join(home, ".cache/matchlock"),
+ 	}
+ 	if sudoHome != "" {
+-		paths = append(paths, filepath.Join(sudoHome, ".cache/matchlock", name))
++		searchDirs = append(searchDirs, filepath.Join(sudoHome, ".cache/matchlock"))
+ 	}
+ 
+-	for _, p := range paths {
+-		if p != "" {
++	// 1. Check environment variable first
++	if envPath := os.Getenv(envVar); envPath != "" {
++		if _, err := os.Stat(envPath); err == nil && isCorrectELFArch(envPath) {
++			return envPath
++		}
++	}
++
++	// 2. Check search directories for both names
++	for _, dir := range searchDirs {
++		for _, n := range searchNames {
++			p := filepath.Join(dir, n)
+ 			if _, err := os.Stat(p); err == nil {
+ 				if isCorrectELFArch(p) {
+ 					return p
+@@ -108,6 +118,17 @@ func findGuestBinary(name, envVar string) string {
+ 			}
+ 		}
+ 	}
++
++	// 3. Fallback to default name in execDir
++	for _, n := range searchNames {
++		p := filepath.Join(execDir, n)
++		if _, err := os.Stat(p); err == nil {
++			if isCorrectELFArch(p) {
++				return p
++			}
++		}
++	}
++
+ 	return filepath.Join(execDir, name)
+ }
+ 
+diff --git a/pkg/sandbox/sandbox_common.go b/pkg/sandbox/sandbox_common.go
+index 014071a..c55fd95 100644
+--- a/pkg/sandbox/sandbox_common.go
++++ b/pkg/sandbox/sandbox_common.go
+@@ -77,7 +77,7 @@ func prepareExecEnv(config *api.Config, caPool *sandboxnet.CAPool, pol *policy.E
+ 	return opts
+ }
+ 
+-func execCommand(ctx context.Context, machine vm.Machine, config *api.Config, caPool *sandboxnet.CAPool, pol *policy.Engine, command string, opts *api.ExecOptions) (*api.ExecResult, error) {
++func execCommand(ctx context.Context, machine vm.Machine, config *api.Config, caPool *sandboxnet.CAPool, pol *policy.Engine, args []string, opts *api.ExecOptions) (*api.ExecResult, error) {
+ 	if opts == nil {
+ 		opts = &api.ExecOptions{}
+ 	}
+@@ -96,7 +96,7 @@ func execCommand(ctx context.Context, machine vm.Machine, config *api.Config, ca
+ 		opts.Env[k] = v
+ 	}
+ 
+-	return machine.Exec(ctx, command, opts)
++	return machine.Exec(ctx, args, opts)
+ }
+ 
+ func writeFile(vfsRoot vfs.Provider, path string, content []byte, mode uint32) error {
 diff --git a/pkg/sandbox/sandbox_linux.go b/pkg/sandbox/sandbox_linux.go
-index acf3f35..12940c3 100644
+index acf3f35..8efb79f 100644
 --- a/pkg/sandbox/sandbox_linux.go
 +++ b/pkg/sandbox/sandbox_linux.go
-@@ -71,7 +71,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -9,6 +9,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"os"
++	"path/filepath"
+ 
+ 	"github.com/jingkaihe/matchlock/internal/errx"
+ 	"github.com/jingkaihe/matchlock/pkg/api"
+@@ -71,16 +72,58 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  	}
  
  	id := config.GetID()
 -	hostname := config.GetHostname()
- 	workspace := config.GetWorkspace()
+-	workspace := config.GetWorkspace()
++	if opts.KernelPath == "" {
++		opts.KernelPath = DefaultKernelPath()
++	}
++	config.KernelPath = opts.KernelPath
  
  	stateMgr := state.NewManager()
-@@ -97,13 +96,8 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
- 	// Create a copy of the rootfs for this VM (copy-on-write if supported)
- 	vmRootfsPath := stateMgr.Dir(id) + "/rootfs.ext4"
- 	if err := copyRootfs(opts.RootfsPath, vmRootfsPath); err != nil {
--		stateMgr.Unregister(id)
- 		return nil, errx.Wrap(ErrCopyRootfs, err)
+ 	if err := stateMgr.Register(id, config); err != nil {
+ 		return nil, errx.Wrap(ErrRegisterState, err)
  	}
--	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
--		r.RootfsPath = vmRootfsPath
--		r.VsockPath = stateMgr.Dir(id) + "/vsock.sock"
--	})
- 
- 	// Inject guest runtime components and resize rootfs
- 	var diskSizeMB int64
-@@ -111,11 +105,63 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
- 		diskSizeMB = int64(config.Resources.DiskSizeMB)
- 	}
- 	if err := prepareRootfs(vmRootfsPath, diskSizeMB); err != nil {
--		os.Remove(vmRootfsPath)
--		stateMgr.Unregister(id)
- 		return nil, errx.Wrap(ErrPrepareRootfs, err)
- 	}
- 
-+	return setupSandbox(ctx, id, config, vmRootfsPath, opts.KernelPath)
-+}
 +
-+// Load recreates a sandbox VM from persisted state.
-+func Load(ctx context.Context, id string, configOverride *api.Config) (*Sandbox, error) {
-+	stateMgr := state.NewManager()
-+	vmState, err := stateMgr.Get(id)
-+	if err != nil {
-+		return nil, errx.Wrap(ErrGetVM, err)
++	// Create a copy of the rootfs for this VM (copy-on-write if supported)
++	vmRootfsPath := filepath.Join(stateMgr.Dir(id), "rootfs.ext4")
++	if err := copyRootfs(opts.RootfsPath, vmRootfsPath); err != nil {
++		stateMgr.Unregister(id)
++		return nil, errx.Wrap(ErrCopyRootfs, err)
 +	}
 +
-+	config, err := api.ParseConfig(vmState.Config)
++	return setupSandbox(ctx, id, config, vmRootfsPath, opts.KernelPath, false)
++}
++
++// Load recreates a sandbox from its persisted state.
++func Load(ctx context.Context, id string, configOverride *api.Config) (*Sandbox, error) {
++	stateMgr := state.NewManager()
++	configData, err := stateMgr.GetConfig(id)
++	if err != nil {
++		return nil, errx.Wrap(ErrParseConfig, err)
++	}
++
++	config, err := api.ParseConfig(configData)
 +	if err != nil {
 +		return nil, errx.Wrap(ErrParseConfig, err)
 +	}
 +
 +	if configOverride != nil {
 +		config = config.Merge(configOverride)
-+		if err := stateMgr.Register(id, config); err != nil {
-+			return nil, errx.Wrap(ErrRegisterState, err)
-+		}
 +	}
 +
-+	vmRootfsPath := stateMgr.Dir(id) + "/rootfs.ext4"
-+	if _, err := os.Stat(vmRootfsPath); os.IsNotExist(err) {
-+		return nil, fmt.Errorf("rootfs not found at %s", vmRootfsPath)
++	vmRootfsPath := filepath.Join(stateMgr.Dir(id), "rootfs.ext4")
++	if _, err := os.Stat(vmRootfsPath); err != nil {
++		return nil, fmt.Errorf("[persistence-v2] rootfs not found for %s at %s", id, vmRootfsPath)
 +	}
 +
-+	return setupSandbox(ctx, id, config, vmRootfsPath, "")
++	return setupSandbox(ctx, id, config, vmRootfsPath, config.KernelPath, true)
 +}
 +
-+func setupSandbox(ctx context.Context, id string, config *api.Config, vmRootfsPath string, kernelPath string) (sb *Sandbox, retErr error) {
++func setupSandbox(ctx context.Context, id string, config *api.Config, vmRootfsPath string, kernelPath string, skipPrepare bool) (sb *Sandbox, retErr error) {
 +	hostname := config.GetHostname()
 +	workspace := config.GetWorkspace()
++
 +	stateMgr := state.NewManager()
-+
-+	lifecycleStore := lifecycle.NewStore(stateMgr.Dir(id))
-+	if err := lifecycleStore.Init(id, "firecracker", stateMgr.Dir(id)); err != nil {
-+		return nil, errx.Wrap(ErrLifecycleInit, err)
-+	}
-+	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
-+		r.StateDir = stateMgr.Dir(id)
-+		r.Workspace = workspace
-+		r.RootfsPath = vmRootfsPath
-+		r.VsockPath = stateMgr.Dir(id) + "/vsock.sock"
-+	})
-+
-+	defer func() {
-+		if retErr != nil {
-+			_ = lifecycleStore.SetLastError(retErr)
-+			_ = lifecycleStore.SetPhase(lifecycle.PhaseCreateFailed)
+ 	lifecycleStore := lifecycle.NewStore(stateMgr.Dir(id))
+ 	if err := lifecycleStore.Init(id, "firecracker", stateMgr.Dir(id)); err != nil {
+-		stateMgr.Unregister(id)
+ 		return nil, errx.Wrap(ErrLifecycleInit, err)
+ 	}
+ 	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
+@@ -94,12 +137,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 		}
+ 	}()
+ 
+-	// Create a copy of the rootfs for this VM (copy-on-write if supported)
+-	vmRootfsPath := stateMgr.Dir(id) + "/rootfs.ext4"
+-	if err := copyRootfs(opts.RootfsPath, vmRootfsPath); err != nil {
+-		stateMgr.Unregister(id)
+-		return nil, errx.Wrap(ErrCopyRootfs, err)
+-	}
+ 	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
+ 		r.RootfsPath = vmRootfsPath
+ 		r.VsockPath = stateMgr.Dir(id) + "/vsock.sock"
+@@ -110,10 +147,10 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 	if config.Resources != nil {
+ 		diskSizeMB = int64(config.Resources.DiskSizeMB)
+ 	}
+-	if err := prepareRootfs(vmRootfsPath, diskSizeMB); err != nil {
+-		os.Remove(vmRootfsPath)
+-		stateMgr.Unregister(id)
+-		return nil, errx.Wrap(ErrPrepareRootfs, err)
++	if !skipPrepare {
++		if err := prepareRootfs(vmRootfsPath, diskSizeMB); err != nil {
++			return nil, errx.Wrap(ErrPrepareRootfs, err)
 +		}
-+	}()
-+
+ 	}
+ 
  	// Create CAPool early and inject cert into rootfs before VM creation
- 	needsProxy := config.Network != nil && (len(config.Network.AllowedHosts) > 0 || len(config.Network.Secrets) > 0)
- 	var caPool *sandboxnet.CAPool
-@@ -138,8 +184,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -123,13 +160,9 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+ 		var err error
+ 		caPool, err = sandboxnet.NewCAPool()
+ 		if err != nil {
+-			os.Remove(vmRootfsPath)
+-			stateMgr.Unregister(id)
+ 			return nil, errx.Wrap(ErrCreateCAPool, err)
+ 		}
+ 		if err := injectConfigFileIntoRootfs(vmRootfsPath, "/etc/ssl/certs/matchlock-ca.crt", caPool.CACertPEM()); err != nil {
+-			os.Remove(vmRootfsPath)
+-			stateMgr.Unregister(id)
+ 			return nil, errx.Wrap(ErrInjectCACert, err)
+ 		}
+ 	}
+@@ -138,8 +171,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  	subnetAlloc := state.NewSubnetAllocator()
  	subnetInfo, err := subnetAlloc.Allocate(id)
  	if err != nil {
@@ -412,92 +965,290 @@ index acf3f35..12940c3 100644
  		return nil, errx.Wrap(ErrAllocateSubnet, err)
  	}
  	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
-@@ -150,7 +194,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -150,16 +181,19 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  
  	backend := linux.NewLinuxBackend()
  
 -	kernelPath := opts.KernelPath
  	if kernelPath == "" {
- 		kernelPath = DefaultKernelPath()
+-		kernelPath = DefaultKernelPath()
++		if config.KernelPath != "" {
++			kernelPath = config.KernelPath
++		} else {
++			kernelPath = DefaultKernelPath()
++		}
  	}
-@@ -158,8 +201,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
++	config.KernelPath = kernelPath
+ 
  	var extraDisks []vm.DiskConfig
  	for _, d := range config.ExtraDisks {
  		if err := api.ValidateGuestMount(d.GuestMount); err != nil {
--			subnetAlloc.Release(id)
+ 			subnetAlloc.Release(id)
 -			stateMgr.Unregister(id)
  			return nil, errx.Wrap(ErrInvalidDiskCfg, err)
  		}
  		extraDisks = append(extraDisks, vm.DiskConfig{
-@@ -193,8 +234,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
- 
+@@ -194,7 +228,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  	machine, err := backend.Create(ctx, vmConfig)
  	if err != nil {
--		subnetAlloc.Release(id)
+ 		subnetAlloc.Release(id)
 -		stateMgr.Unregister(id)
  		return nil, errx.Wrap(ErrCreateVM, err)
  	}
  
-@@ -224,8 +263,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
- 	overlaySnapshots, err := prepareOverlaySnapshots(config, stateMgr.Dir(id))
+@@ -225,7 +258,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  	if err != nil {
  		machine.Close(ctx)
--		subnetAlloc.Release(id)
+ 		subnetAlloc.Release(id)
 -		stateMgr.Unregister(id)
  		return nil, err
  	}
  
-@@ -254,8 +291,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
- 		})
+@@ -255,7 +287,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  		if err != nil {
  			machine.Close(ctx)
--			subnetAlloc.Release(id)
+ 			subnetAlloc.Release(id)
 -			stateMgr.Unregister(id)
  			return nil, errx.Wrap(ErrCreateProxy, err)
  		}
  
-@@ -265,8 +300,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
- 		if err := fwRules.Setup(); err != nil {
+@@ -266,7 +297,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  			proxy.Close()
  			machine.Close(ctx)
--			subnetAlloc.Release(id)
+ 			subnetAlloc.Release(id)
 -			stateMgr.Unregister(id)
  			return nil, errx.Wrap(ErrFirewallSetup, err)
  		}
  	}
-@@ -295,15 +328,10 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
- 	vfsSocketPath := fmt.Sprintf("%s_%d", vmConfig.VsockPath, linux.VsockPortVFS)
- 	vfsStopFunc, err := vfsServer.ServeUDSBackground(vfsSocketPath)
- 	if err != nil {
--		if proxy != nil {
--			proxy.Close()
--		}
--		if fwRules != nil {
--			fwRules.Cleanup()
-+		if err := lifecycleStore.SetPhase(lifecycle.PhaseCreateFailed); err != nil {
-+			return nil, errx.Wrap(ErrLifecycleUpdate, err)
+@@ -303,7 +333,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  		}
--		machine.Close(ctx)
--		subnetAlloc.Release(id)
+ 		machine.Close(ctx)
+ 		subnetAlloc.Release(id)
 -		stateMgr.Unregister(id)
-+		_ = lifecycleStore.SetLastError(err)
  		return nil, errx.Wrap(ErrVFSServer, err)
  	}
  
-@@ -432,6 +460,16 @@ func (s *Sandbox) ListFiles(ctx context.Context, path string) ([]api.FileInfo, e
- 	return listFiles(s.vfsRoot, path)
+@@ -412,8 +441,14 @@ func (s *Sandbox) PrepareExecEnv() *api.ExecOptions {
+ 	return prepareExecEnv(s.config, s.caPool, s.policy)
  }
  
-+// UpdateNetworkConfig updates the sandbox network configuration.
-+func (s *Sandbox) UpdateNetworkConfig(netCfg *api.NetworkConfig) {
+-func (s *Sandbox) Exec(ctx context.Context, command string, opts *api.ExecOptions) (*api.ExecResult, error) {
+-	return execCommand(ctx, s.machine, s.config, s.caPool, s.policy, command, opts)
++func (s *Sandbox) UpdateNetworkConfig(config *api.NetworkConfig) {
 +	if s.policy != nil {
-+		s.policy.UpdateAllowedHosts(netCfg.AllowedHosts)
++		s.policy.UpdateAllowedHosts(config.AllowedHosts)
 +	}
-+	s.config.Network = netCfg
-+	// Persist updated config to DB
-+	_ = s.stateMgr.Register(s.id, s.config)
 +}
 +
- // Events returns a channel for receiving sandbox events.
- func (s *Sandbox) Events() <-chan api.Event {
- 	return s.events
++func (s *Sandbox) Exec(ctx context.Context, args []string, opts *api.ExecOptions) (*api.ExecResult, error) {
++	return execCommand(ctx, s.machine, s.config, s.caPool, s.policy, args, opts)
+ }
+ 
+ func (s *Sandbox) WriteFile(ctx context.Context, path string, content []byte, mode uint32) error {
+@@ -537,10 +572,14 @@ func (s *Sandbox) Close(ctx context.Context) error {
+ 	markCleanup("overlay_snapshot_remove", overlayCleanupErr)
+ 
+ 	// Remove rootfs copy to save disk space
+-	rootfsCopy := s.stateMgr.Dir(s.id) + "/rootfs.ext4"
+-	if err := os.Remove(rootfsCopy); err != nil && !os.IsNotExist(err) {
+-		errs = append(errs, errx.Wrap(ErrRemoveRootfs, err))
+-		markCleanup("rootfs_remove", err)
++	if !s.config.Persistence {
++		rootfsCopy := filepath.Join(s.stateMgr.Dir(s.id), "rootfs.ext4")
++		if err := os.Remove(rootfsCopy); err != nil && !os.IsNotExist(err) {
++			errs = append(errs, errx.Wrap(ErrRemoveRootfs, err))
++			markCleanup("rootfs_remove", err)
++		} else {
++			markCleanup("rootfs_remove", nil)
++		}
+ 	} else {
+ 		markCleanup("rootfs_remove", nil)
+ 	}
+diff --git a/pkg/state/state.go b/pkg/state/state.go
+index d10371c..aa58bfc 100644
+--- a/pkg/state/state.go
++++ b/pkg/state/state.go
+@@ -179,6 +179,14 @@ func (m *Manager) Get(id string) (VMState, error) {
+ 	return state, nil
+ }
+ 
++func (m *Manager) GetConfig(id string) ([]byte, error) {
++	state, err := m.Get(id)
++	if err != nil {
++		return nil, err
++	}
++	return state.Config, nil
++}
++
+ type rowScanner interface {
+ 	Scan(dest ...interface{}) error
+ }
+diff --git a/pkg/vm/backend.go b/pkg/vm/backend.go
+index da8cddf..a35f23e 100644
+--- a/pkg/vm/backend.go
++++ b/pkg/vm/backend.go
+@@ -53,7 +53,7 @@ type Machine interface {
+ 	Start(ctx context.Context) error
+ 	Stop(ctx context.Context) error
+ 	Wait(ctx context.Context) error
+-	Exec(ctx context.Context, command string, opts *api.ExecOptions) (*api.ExecResult, error)
++	Exec(ctx context.Context, args []string, opts *api.ExecOptions) (*api.ExecResult, error)
+ 	NetworkFD() (int, error)
+ 	VsockFD() (int, error)
+ 	PID() int
+@@ -63,7 +63,7 @@ type Machine interface {
+ 
+ type InteractiveMachine interface {
+ 	Machine
+-	ExecInteractive(ctx context.Context, command string, opts *api.ExecOptions, rows, cols uint16, stdin io.Reader, stdout io.Writer, resizeCh <-chan [2]uint16) (int, error)
++	ExecInteractive(ctx context.Context, args []string, opts *api.ExecOptions, rows, cols uint16, stdin io.Reader, stdout io.Writer, resizeCh <-chan [2]uint16) (int, error)
+ }
+ 
+ // VsockDialer is implemented by backends that can establish host-initiated
+diff --git a/pkg/vm/linux/backend.go b/pkg/vm/linux/backend.go
+index bd5c2f2..6a6b3e7 100644
+--- a/pkg/vm/linux/backend.go
++++ b/pkg/vm/linux/backend.go
+@@ -112,6 +112,14 @@ func (m *LinuxMachine) Start(ctx context.Context) error {
+ 		return nil
+ 	}
+ 
++	// Clean up stale sockets from previous runs
++	if m.config.SocketPath != "" {
++		_ = os.Remove(m.config.SocketPath)
++	}
++	if m.config.VsockPath != "" {
++		_ = os.Remove(m.config.VsockPath)
++	}
++
+ 	fcConfig := m.generateFirecrackerConfig()
+ 
+ 	configPath := filepath.Join(filepath.Dir(m.config.SocketPath), "config.json")
+@@ -177,11 +185,18 @@ func (m *LinuxMachine) waitForReady(ctx context.Context, timeout time.Duration)
+ 
+ 	for time.Now().Before(deadline) {
+ 		select {
+-		case <-ctx.Done():
+-			return ctx.Err()
+ 		default:
+ 		}
+ 
++		// Check if Firecracker process is still running
++		if m.cmd != nil && m.cmd.Process != nil {
++			var status syscall.WaitStatus
++			pid, err := syscall.Wait4(m.cmd.Process.Pid, &status, syscall.WNOHANG, nil)
++			if err == nil && pid > 0 {
++				return fmt.Errorf("firecracker process %d exited prematurely", m.cmd.Process.Pid)
++			}
++		}
++
+ 		// Try to connect to the ready port via UDS forwarded by Firecracker
+ 		conn, err := m.dialVsock(VsockPortReady)
+ 		if err == nil {
+@@ -408,11 +423,11 @@ func (m *LinuxMachine) Wait(ctx context.Context) error {
+ 	return m.cmd.Wait()
+ }
+ 
+-func (m *LinuxMachine) Exec(ctx context.Context, command string, opts *api.ExecOptions) (*api.ExecResult, error) {
++func (m *LinuxMachine) Exec(ctx context.Context, args []string, opts *api.ExecOptions) (*api.ExecResult, error) {
+ 	if m.config.VsockCID == 0 || m.config.VsockPath == "" {
+ 		return nil, ErrVsockNotConfigured
+ 	}
+-	return m.execVsock(ctx, command, opts)
++	return m.execVsock(ctx, args, opts)
+ }
+ 
+ // execVsock executes a command via vsock.
+@@ -420,13 +435,13 @@ func (m *LinuxMachine) Exec(ctx context.Context, command string, opts *api.ExecO
+ // forwards output chunks to the writers in real-time.
+ // When opts.Stdin is set, uses pipe mode (MsgTypeExecPipe) which additionally
+ // forwards stdin to the guest process without allocating a PTY.
+-func (m *LinuxMachine) execVsock(ctx context.Context, command string, opts *api.ExecOptions) (*api.ExecResult, error) {
++func (m *LinuxMachine) execVsock(ctx context.Context, args []string, opts *api.ExecOptions) (*api.ExecResult, error) {
+ 	if opts != nil && opts.Stdin != nil {
+ 		conn, err := m.dialVsock(VsockPortExec)
+ 		if err != nil {
+ 			return nil, errx.Wrap(ErrExecConnect, err)
+ 		}
+-		return vsock.ExecPipe(ctx, conn, command, opts)
++		return vsock.ExecPipe(ctx, conn, args, opts)
+ 	}
+ 
+ 	start := time.Now()
+@@ -444,8 +459,14 @@ func (m *LinuxMachine) execVsock(ctx context.Context, command string, opts *api.
+ 	})
+ 	defer stop()
+ 
++	if len(args) == 0 {
++		return nil, fmt.Errorf("command arguments cannot be empty")
++	}
++
++	// Build exec request
+ 	req := vsock.ExecRequest{
+-		Command: command,
++		Command: args[0],
++		Args:    args[1:],
+ 	}
+ 	if opts != nil {
+ 		req.WorkingDir = opts.WorkingDir
+@@ -552,7 +573,7 @@ func (m *LinuxMachine) execVsock(ctx context.Context, command string, opts *api.
+ }
+ 
+ // ExecInteractive executes a command with PTY support for interactive sessions
+-func (m *LinuxMachine) ExecInteractive(ctx context.Context, command string, opts *api.ExecOptions, rows, cols uint16, stdin io.Reader, stdout io.Writer, resizeCh <-chan [2]uint16) (int, error) {
++func (m *LinuxMachine) ExecInteractive(ctx context.Context, args []string, opts *api.ExecOptions, rows, cols uint16, stdin io.Reader, stdout io.Writer, resizeCh <-chan [2]uint16) (int, error) {
+ 	if m.config.VsockCID == 0 || m.config.VsockPath == "" {
+ 		return 1, ErrVsockNotConfigured
+ 	}
+@@ -563,9 +584,14 @@ func (m *LinuxMachine) ExecInteractive(ctx context.Context, command string, opts
+ 	}
+ 	defer conn.Close()
+ 
++	if len(args) == 0 {
++		return 1, fmt.Errorf("command arguments cannot be empty")
++	}
++
+ 	// Build TTY exec request
+ 	req := vsock.ExecTTYRequest{
+-		Command: command,
++		Command: args[0],
++		Args:    args[1:],
+ 		Rows:    rows,
+ 		Cols:    cols,
+ 	}
+diff --git a/pkg/vsock/wire.go b/pkg/vsock/wire.go
+index 04afff1..52da761 100644
+--- a/pkg/vsock/wire.go
++++ b/pkg/vsock/wire.go
+@@ -14,6 +14,7 @@ import (
+ 	"context"
+ 	"encoding/binary"
+ 	"encoding/json"
++	"fmt"
+ 
+ 	"net"
+ 	"time"
+@@ -95,14 +96,21 @@ func OpenPortForward(conn net.Conn, host string, port uint16) error {
+ // ExecPipe executes a command over a vsock connection with bidirectional
+ // stdin/stdout/stderr piping (no PTY). The caller must supply an already-dialed
+ // conn; ExecPipe takes ownership and closes it when done.
+-func ExecPipe(ctx context.Context, conn net.Conn, command string, opts *api.ExecOptions) (*api.ExecResult, error) {
++func ExecPipe(ctx context.Context, conn net.Conn, args []string, opts *api.ExecOptions) (*api.ExecResult, error) {
+ 	start := time.Now()
+ 	defer conn.Close()
+ 
+ 	stop := context.AfterFunc(ctx, func() { conn.Close() })
+ 	defer stop()
+ 
+-	req := ExecRequest{Command: command}
++	if len(args) == 0 {
++		return nil, fmt.Errorf("command arguments cannot be empty")
++	}
++
++	req := ExecRequest{
++		Command: args[0],
++		Args:    args[1:],
++	}
+ 	if opts != nil {
+ 		req.WorkingDir = opts.WorkingDir
+ 		req.Env = opts.Env
