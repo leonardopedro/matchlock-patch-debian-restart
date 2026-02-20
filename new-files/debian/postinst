@@ -7,8 +7,8 @@ set -e
 case "$1" in
     configure)
         if command -v setcap >/dev/null 2>&1; then
-            echo "Setting capabilities for /usr/bin/matchlock..."
-            (setcap cap_net_admin,cap_net_raw+ep /usr/bin/matchlock && /usr/bin/matchlock setup linux) || echo "Warning: Failed to set capabilities on /usr/bin/matchlock"
+            echo "Setting capabilities for /usr/local/bin/matchlock..."
+            (setcap cap_net_admin,cap_net_raw+ep /usr/local/bin/matchlock && /usr/local/bin/matchlock setup linux) || echo "Warning: Failed to set capabilities on /usr/bin/matchlock"
         else
             echo "Warning: setcap not found. Network capabilities for non-root users will not be available."
         fi

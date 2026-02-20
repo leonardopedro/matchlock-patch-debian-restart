@@ -46,3 +46,9 @@ echo "  mise trust # For mise to trust the scripts"
 echo "  mise run build:deb            # To build Matchlock .deb"
 echo "  chmod a+x ./scripts/build-firecracker-deb.sh && mise run build:firecracker:deb # To build Firecracker.deb"
 echo "=========================================================="
+
+
+#rm -r ~/.matchlock/*
+#leo@leoPC:/media/leo/e7ed9d6f-5f0a-4e19-a74e-83424bc154ba/matchlock-patch-debian-restart$ mkdir /home/leo/.matchlock/cache
+#leo@leoPC:/media/leo/e7ed9d6f-5f0a-4e19-a74e-83424bc154ba/matchlock-patch-debian-restart$ ln -s /home/leo/.matchlock/cache ~/.cache/matchlock
+#rm -r ~/.matchlock/* && mkdir ~/.matchlock/cache && sudo matchlock setup linux

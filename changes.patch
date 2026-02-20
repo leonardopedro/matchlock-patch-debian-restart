@@ -51,33 +51,15 @@ index d4bce32..32cfbb5 100644
  		return fmt.Errorf("-it requires a TTY")
  	}
 diff --git a/cmd/matchlock/cmd_run.go b/cmd/matchlock/cmd_run.go
-index f78ed11..b21ec6a 100644
+index f78ed11..1d917c5 100644
 --- a/cmd/matchlock/cmd_run.go
 +++ b/cmd/matchlock/cmd_run.go
-@@ -106,6 +106,7 @@ func init() {
- 	runCmd.Flags().StringP("user", "u", "", "Run as user (uid, uid:gid, or username; overrides image USER)")
- 	runCmd.Flags().String("entrypoint", "", "Override image ENTRYPOINT")
- 	runCmd.Flags().Duration("graceful-shutdown", api.DefaultGracefulShutdownPeriod, "Graceful shutdown timeout before force-stopping the VM ")
-+	runCmd.Flags().Bool("persistence", false, "Keep filesystem changes between restarts")
- 	runCmd.MarkFlagRequired("image")
- 
- 	viper.BindPFlag("run.image", runCmd.Flags().Lookup("image"))
-@@ -138,6 +139,7 @@ func runRun(cmd *cobra.Command, args []string) error {
- 	pull, _ := cmd.Flags().GetBool("pull")
- 	rm, _ := cmd.Flags().GetBool("rm")
- 	privileged, _ := cmd.Flags().GetBool("privileged")
-+	persistence, _ := cmd.Flags().GetBool("persistence")
- 
- 	// Resources
- 	cpus, _ := cmd.Flags().GetInt("cpus")
-@@ -169,13 +171,18 @@ func runRun(cmd *cobra.Command, args []string) error {
+@@ -169,13 +169,16 @@ func runRun(cmd *cobra.Command, args []string) error {
  		return fmt.Errorf("--mtu must be > 0")
  	}
  
-+	// If persistence is enabled, we should NOT remove the sandbox state by default
-+	if persistence && !cmd.Flags().Changed("rm") {
-+		rm = false
-+	}
++	// If rm is false, we enable persistence for the sandbox filesystem
++	persistence := !rm
 +
  	// Shutdown
  	gracefulShutdown, _ := cmd.Flags().GetDuration("graceful-shutdown")
@@ -90,7 +72,7 @@ index f78ed11..b21ec6a 100644
  
  	var ctx context.Context
  	var cancel context.CancelFunc
-@@ -238,11 +245,11 @@ func runRun(cmd *cobra.Command, args []string) error {
+@@ -238,11 +241,11 @@ func runRun(cmd *cobra.Command, args []string) error {
  	if imageCfg != nil {
  		composed := imageCfg.ComposeCommand(args)
  		if len(composed) > 0 {
@@ -104,7 +86,7 @@ index f78ed11..b21ec6a 100644
  		return fmt.Errorf("command required (or use --rm=false to start without a command)")
  	}
  
-@@ -301,8 +308,9 @@ func runRun(cmd *cobra.Command, args []string) error {
+@@ -301,8 +304,9 @@ func runRun(cmd *cobra.Command, args []string) error {
  	}
  
  	config := &api.Config{
@@ -116,7 +98,7 @@ index f78ed11..b21ec6a 100644
  		Resources: &api.Resources{
  			CPUs:           cpus,
  			MemoryMB:       memory,
-@@ -327,29 +335,7 @@ func runRun(cmd *cobra.Command, args []string) error {
+@@ -327,29 +331,7 @@ func runRun(cmd *cobra.Command, args []string) error {
  	if err != nil {
  		return errx.Wrap(ErrCreateSandbox, err)
  	}
@@ -146,16 +128,16 @@ index f78ed11..b21ec6a 100644
  
  	closeCtx := func() (context.Context, context.CancelFunc) {
  		return context.WithTimeout(context.Background(), gracefulShutdown)
-@@ -363,7 +349,7 @@ func runRun(cmd *cobra.Command, args []string) error {
+@@ -363,7 +345,7 @@ func runRun(cmd *cobra.Command, args []string) error {
  		if err := sb.Close(c); err != nil {
  			errs = append(errs, errx.Wrap(ErrCloseSandbox, err))
  		}
 -		if remove {
-+		if remove && !persistence {
++		if remove && !sb.Config().Persistence {
  			if err := stateMgr.Remove(sb.ID()); err != nil {
  				errs = append(errs, errx.Wrap(ErrRemoveSandbox, err))
  			}
-@@ -374,6 +360,32 @@ func runRun(cmd *cobra.Command, args []string) error {
+@@ -374,6 +356,32 @@ func runRun(cmd *cobra.Command, args []string) error {
  		return nil
  	}
  
@@ -188,7 +170,7 @@ index f78ed11..b21ec6a 100644
  	var pfManager *sandbox.PortForwardManager
  	if len(portForwards) > 0 {
  		pfManager, err = sb.StartPortForwards(ctx, addresses, portForwards)
-@@ -395,17 +407,14 @@ func runRun(cmd *cobra.Command, args []string) error {
+@@ -395,17 +403,14 @@ func runRun(cmd *cobra.Command, args []string) error {
  	if interactiveMode {
  		exitCode := runInteractive(ctx, sb, command, workdir)
  		if rm {
@@ -208,7 +190,7 @@ index f78ed11..b21ec6a 100644
  		opts := &api.ExecOptions{
  			Stdout: os.Stdout,
  			Stderr: os.Stderr,
-@@ -418,18 +427,10 @@ func runRun(cmd *cobra.Command, args []string) error {
+@@ -418,32 +423,34 @@ func runRun(cmd *cobra.Command, args []string) error {
  		}
  		result, err := sb.Exec(ctx, command, opts)
  		if err != nil {
@@ -227,11 +209,23 @@ index f78ed11..b21ec6a 100644
  			return commandExit(result.ExitCode)
  		}
  	}
-@@ -437,13 +438,13 @@ func runRun(cmd *cobra.Command, args []string) error {
+ 
  	if !rm {
- 		// Block until signal — keeps the sandbox alive for `matchlock exec`
- 		<-ctx.Done()
+-		// Block until signal — keeps the sandbox alive for `matchlock exec`
+-		<-ctx.Done()
 -		return cleanupSandbox(false)
++		fmt.Fprintf(os.Stderr, "Sandbox %s is running. Press Ctrl+C to stop it.\n", sb.ID())
++		// Wait for either the VM to halt or the user to signal exit
++		select {
++		case <-ctx.Done():
++			// User signaled exit
++		case err := <-waitCh(sb):
++			if err != nil {
++				fmt.Fprintf(os.Stderr, "VM exited with error: %v\n", err)
++			} else {
++				fmt.Fprintf(os.Stderr, "VM halted.\n")
++			}
++		}
 +		return nil
  	}
  
@@ -243,6 +237,18 @@ index f78ed11..b21ec6a 100644
  	if !term.IsTerminal(int(os.Stdin.Fd())) {
  		fmt.Fprintln(os.Stderr, "Error: -it requires a TTY")
  		return 1
+@@ -497,3 +504,11 @@ func runInteractive(ctx context.Context, sb *sandbox.Sandbox, command, workdir s
+ 
+ 	return exitCode
+ }
++
++func waitCh(sb *sandbox.Sandbox) <-chan error {
++	ch := make(chan error, 1)
++	go func() {
++		ch <- sb.Wait(context.Background())
++	}()
++	return ch
++}
 diff --git a/cmd/matchlock/errors.go b/cmd/matchlock/errors.go
 index bb82a9f..3f296a0 100644
 --- a/cmd/matchlock/errors.go
@@ -841,7 +847,7 @@ index 014071a..c55fd95 100644
  
  func writeFile(vfsRoot vfs.Provider, path string, content []byte, mode uint32) error {
 diff --git a/pkg/sandbox/sandbox_linux.go b/pkg/sandbox/sandbox_linux.go
-index acf3f35..8efb79f 100644
+index acf3f35..77bbd13 100644
 --- a/pkg/sandbox/sandbox_linux.go
 +++ b/pkg/sandbox/sandbox_linux.go
 @@ -9,6 +9,7 @@ import (
@@ -852,7 +858,7 @@ index acf3f35..8efb79f 100644
  
  	"github.com/jingkaihe/matchlock/internal/errx"
  	"github.com/jingkaihe/matchlock/pkg/api"
-@@ -71,16 +72,58 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -71,16 +72,62 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  	}
  
  	id := config.GetID()
@@ -900,6 +906,10 @@ index acf3f35..8efb79f 100644
 +		return nil, fmt.Errorf("[persistence-v2] rootfs not found for %s at %s", id, vmRootfsPath)
 +	}
 +
++	if err := stateMgr.Register(id, config); err != nil {
++		return nil, errx.Wrap(ErrRegisterState, err)
++	}
++
 +	return setupSandbox(ctx, id, config, vmRootfsPath, config.KernelPath, true)
 +}
 +
@@ -914,7 +924,7 @@ index acf3f35..8efb79f 100644
  		return nil, errx.Wrap(ErrLifecycleInit, err)
  	}
  	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
-@@ -94,12 +137,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -94,12 +141,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  		}
  	}()
  
@@ -927,7 +937,7 @@ index acf3f35..8efb79f 100644
  	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
  		r.RootfsPath = vmRootfsPath
  		r.VsockPath = stateMgr.Dir(id) + "/vsock.sock"
-@@ -110,10 +147,10 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -110,10 +151,10 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  	if config.Resources != nil {
  		diskSizeMB = int64(config.Resources.DiskSizeMB)
  	}
@@ -942,7 +952,7 @@ index acf3f35..8efb79f 100644
  	}
  
  	// Create CAPool early and inject cert into rootfs before VM creation
-@@ -123,13 +160,9 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -123,13 +164,9 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  		var err error
  		caPool, err = sandboxnet.NewCAPool()
  		if err != nil {
@@ -956,7 +966,7 @@ index acf3f35..8efb79f 100644
  			return nil, errx.Wrap(ErrInjectCACert, err)
  		}
  	}
-@@ -138,8 +171,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -138,8 +175,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  	subnetAlloc := state.NewSubnetAllocator()
  	subnetInfo, err := subnetAlloc.Allocate(id)
  	if err != nil {
@@ -965,7 +975,7 @@ index acf3f35..8efb79f 100644
  		return nil, errx.Wrap(ErrAllocateSubnet, err)
  	}
  	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
-@@ -150,16 +181,19 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -150,16 +185,19 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  
  	backend := linux.NewLinuxBackend()
  
@@ -988,7 +998,7 @@ index acf3f35..8efb79f 100644
  			return nil, errx.Wrap(ErrInvalidDiskCfg, err)
  		}
  		extraDisks = append(extraDisks, vm.DiskConfig{
-@@ -194,7 +228,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -194,7 +232,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  	machine, err := backend.Create(ctx, vmConfig)
  	if err != nil {
  		subnetAlloc.Release(id)
@@ -996,7 +1006,7 @@ index acf3f35..8efb79f 100644
  		return nil, errx.Wrap(ErrCreateVM, err)
  	}
  
-@@ -225,7 +258,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -225,7 +262,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  	if err != nil {
  		machine.Close(ctx)
  		subnetAlloc.Release(id)
@@ -1004,7 +1014,7 @@ index acf3f35..8efb79f 100644
  		return nil, err
  	}
  
-@@ -255,7 +287,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -255,7 +291,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  		if err != nil {
  			machine.Close(ctx)
  			subnetAlloc.Release(id)
@@ -1012,7 +1022,7 @@ index acf3f35..8efb79f 100644
  			return nil, errx.Wrap(ErrCreateProxy, err)
  		}
  
-@@ -266,7 +297,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -266,7 +301,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  			proxy.Close()
  			machine.Close(ctx)
  			subnetAlloc.Release(id)
@@ -1020,7 +1030,7 @@ index acf3f35..8efb79f 100644
  			return nil, errx.Wrap(ErrFirewallSetup, err)
  		}
  	}
-@@ -303,7 +333,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
+@@ -303,7 +337,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
  		}
  		machine.Close(ctx)
  		subnetAlloc.Release(id)
@@ -1028,7 +1038,25 @@ index acf3f35..8efb79f 100644
  		return nil, errx.Wrap(ErrVFSServer, err)
  	}
  
-@@ -412,8 +441,14 @@ func (s *Sandbox) PrepareExecEnv() *api.ExecOptions {
+@@ -372,6 +405,8 @@ func (s *Sandbox) Start(ctx context.Context) error {
+ 		}
+ 		return err
+ 	}
++	// Record the actual Firecracker PID in the state database
++	_ = s.stateMgr.UpdatePID(s.id, s.machine.PID())
+ 	if s.lifecycle != nil {
+ 		if err := s.lifecycle.SetPhase(lifecycle.PhaseRunning); err != nil {
+ 			return errx.Wrap(ErrLifecycleUpdate, err)
+@@ -408,12 +443,23 @@ func (s *Sandbox) Stop(ctx context.Context) error {
+ 	return nil
+ }
+ 
++// Wait waits for the sandbox VM to exit.
++func (s *Sandbox) Wait(ctx context.Context) error {
++	return s.machine.Wait(ctx)
++}
++
+ func (s *Sandbox) PrepareExecEnv() *api.ExecOptions {
  	return prepareExecEnv(s.config, s.caPool, s.policy)
  }
  
@@ -1045,7 +1073,7 @@ index acf3f35..8efb79f 100644
  }
  
  func (s *Sandbox) WriteFile(ctx context.Context, path string, content []byte, mode uint32) error {
-@@ -537,10 +572,14 @@ func (s *Sandbox) Close(ctx context.Context) error {
+@@ -537,10 +583,14 @@ func (s *Sandbox) Close(ctx context.Context) error {
  	markCleanup("overlay_snapshot_remove", overlayCleanupErr)
  
  	// Remove rootfs copy to save disk space
@@ -1064,11 +1092,62 @@ index acf3f35..8efb79f 100644
  	} else {
  		markCleanup("rootfs_remove", nil)
  	}
+diff --git a/pkg/state/errors.go b/pkg/state/errors.go
+index ac1fb9e..2f1502b 100644
+--- a/pkg/state/errors.go
++++ b/pkg/state/errors.go
+@@ -10,6 +10,7 @@ var (
+ 	ErrGetVM        = errors.New("get VM")
+ 	ErrKillVM       = errors.New("kill VM")
+ 	ErrRemoveVM     = errors.New("remove VM")
++	ErrUpdateVM     = errors.New("update VM")
+ 
+ 	ErrNoAvailableSubnets   = errors.New("no available subnets")
+ 	ErrSaveSubnetAllocation = errors.New("failed to save subnet allocation")
 diff --git a/pkg/state/state.go b/pkg/state/state.go
-index d10371c..aa58bfc 100644
+index d10371c..31f0363 100644
 --- a/pkg/state/state.go
 +++ b/pkg/state/state.go
-@@ -179,6 +179,14 @@ func (m *Manager) Get(id string) (VMState, error) {
+@@ -118,6 +118,17 @@ func (m *Manager) Unregister(id string) error {
+ 	return nil
+ }
+ 
++func (m *Manager) UpdatePID(id string, pid int) error {
++	if err := m.ready(); err != nil {
++		return err
++	}
++	_, err := m.db.Exec(`UPDATE vms SET pid = ?, updated_at = ? WHERE id = ?`, pid, time.Now().UTC().Format(time.RFC3339Nano), id)
++	if err != nil {
++		return errx.Wrap(ErrUpdateVM, err)
++	}
++	return nil
++}
++
+ func (m *Manager) List() ([]VMState, error) {
+ 	if err := m.ready(); err != nil {
+ 		return nil, err
+@@ -137,7 +148,7 @@ func (m *Manager) List() ([]VMState, error) {
+ 			return nil, errx.Wrap(ErrListVMs, err)
+ 		}
+ 
+-		if state.Status == "running" && !m.isProcessRunning(state.PID) {
++		if state.Status == "running" && !m.IsProcessRunning(state.PID) {
+ 			state.Status = "crashed"
+ 			crashedIDs = append(crashedIDs, state.ID)
+ 		}
+@@ -176,9 +187,26 @@ func (m *Manager) Get(id string) (VMState, error) {
+ 		}
+ 		return VMState{}, errx.Wrap(ErrGetVM, err)
+ 	}
++
++	if state.Status == "running" && !m.IsProcessRunning(state.PID) {
++		state.Status = "crashed"
++		// Async update of the database to fix the stale state
++		go func(vmID string) {
++			_, _ = m.db.Exec(`UPDATE vms SET status = ?, updated_at = ? WHERE id = ?`, "crashed", time.Now().UTC().Format(time.RFC3339Nano), vmID)
++		}(state.ID)
++	}
++
  	return state, nil
  }
  
@@ -1083,6 +1162,24 @@ index d10371c..aa58bfc 100644
  type rowScanner interface {
  	Scan(dest ...interface{}) error
  }
+@@ -236,7 +264,7 @@ func (m *Manager) Remove(id string) error {
+ 		return err
+ 	}
+ 	if state.Status == "running" {
+-		if m.isProcessRunning(state.PID) {
++		if m.IsProcessRunning(state.PID) {
+ 			return fmt.Errorf("cannot remove running VM %s, kill it first", id)
+ 		}
+ 		_, _ = m.db.Exec(`UPDATE vms SET status = ?, updated_at = ? WHERE id = ?`, "crashed", time.Now().UTC().Format(time.RFC3339Nano), id)
+@@ -282,7 +310,7 @@ func (m *Manager) Prune() ([]string, error) {
+ 	return pruned, nil
+ }
+ 
+-func (m *Manager) isProcessRunning(pid int) bool {
++func (m *Manager) IsProcessRunning(pid int) bool {
+ 	if pid == 0 {
+ 		return false
+ 	}
 diff --git a/pkg/vm/backend.go b/pkg/vm/backend.go
 index da8cddf..a35f23e 100644
 --- a/pkg/vm/backend.go

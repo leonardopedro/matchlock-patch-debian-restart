@@ -43,7 +43,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return errx.With(ErrVMNotFound, " %s: %w", id, err)
 	}
 	if vmState.Status == "running" {
-		return errx.With(ErrVMRunning, " %s", id)
+		if mgr.IsProcessRunning(vmState.PID) {
+			return errx.With(ErrVMRunning, " %s (PID: %d)", id, vmState.PID)
+		}
+		// Stale running state, proceed with load
+		fmt.Fprintf(os.Stderr, "Note: VM %s was marked as running but process %d is dead. Restarting...\n", id, vmState.PID)
 	}
 
 	var configOverride *api.Config
@@ -62,6 +66,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return errx.Wrap(ErrStartSandbox, err)
 	}
+	defer sb.Close(context.Background())
 
 	if err := sb.Start(ctx); err != nil {
 		return errx.Wrap(ErrStartSandbox, err)
@@ -102,7 +107,24 @@ func runStart(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "  Stop:    matchlock kill %s\n", sb.ID())
 
 	// Wait until signal or exit
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+		// User signaled exit
+	case err := <-waitChStart(sb):
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "VM exited with error: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "VM halted.\n")
+		}
+	}
 
-	return sb.Close(context.Background())
+	return nil
+}
+
+func waitChStart(sb *sandbox.Sandbox) <-chan error {
+	ch := make(chan error, 1)
+	go func() {
+		ch <- sb.Wait(context.Background())
+	}()
+	return ch
 }
