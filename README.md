@@ -1,5 +1,7 @@
 ALL IN THIS REPOSITORY IS WORK IN PROGRESS, MOSTLY AI GENERATED, PROBABLY NOTHING WORKS
 
+For Matchlock commit id: daeaf49
+
 # Matchlock & Firecracker: Build and Run Instructions
  
  This guide provides the steps to apply the persistence patch, build the Debian packages with `mise`, and use the new CLI commands for VM restarts and allow-list updates.
